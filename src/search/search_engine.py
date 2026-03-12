@@ -1,6 +1,11 @@
 """
 Search engine: index drawing files and perform full-text + drawing-number search.
 Persists index as JSON for fast re-search without re-parsing.
+
+Performance features:
+  - Incremental indexing (skip files whose mtime/size haven't changed)
+  - Parallel extraction with ThreadPoolExecutor
+  - Batch JSON save (every SAVE_BATCH_SIZE files + final)
 """
 from __future__ import annotations
 
@@ -8,6 +13,7 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
@@ -30,6 +36,12 @@ DEFAULT_INDEX_PATH = os.path.join(
     os.path.expanduser("~"), ".drawing_search", "index.json"
 )
 
+# How many files to process before writing index to disk (mid-run checkpoint)
+SAVE_BATCH_SIZE = 50
+
+# Default number of parallel worker threads
+DEFAULT_MAX_WORKERS = min(8, (os.cpu_count() or 2) * 2)
+
 
 @dataclass
 class IndexEntry:
@@ -41,6 +53,9 @@ class IndexEntry:
     title: Optional[str]
     indexed_at: float        # Unix timestamp
     error: Optional[str]
+    # --- incremental indexing metadata ---
+    file_mtime: float = 0.0  # os.path.getmtime at index time
+    file_size: int = 0       # os.path.getsize  at index time
 
 
 @dataclass
@@ -71,43 +86,143 @@ class DrawingSearchEngine:
         directory: str,
         recursive: bool = True,
         progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        force: bool = False,
+        max_workers: Optional[int] = None,
     ) -> Tuple[int, int]:
         """
         Scan *directory* and index all supported drawing files.
 
-        progress_callback(file_path, current, total) is called for each file.
+        Incremental: files whose mtime and size haven't changed since the last
+        index are skipped automatically (unless *force=True*).
+
+        Parallel: files are extracted in parallel using a thread pool.
+        I/O-bound work (file reading) benefits well from threading.
+
+        progress_callback(file_path, current, total) is called for each file
+        as it completes (from the main thread via a result queue).
+
         Returns (indexed_count, error_count).
         """
         files = list(self._discover_files(directory, recursive))
         total = len(files)
+
+        # --- Partition: skip unchanged, process changed/new ---
+        to_process: List[str] = []
+        skipped = 0
+        for fpath in files:
+            if not force and self._is_up_to_date(fpath):
+                skipped += 1
+            else:
+                to_process.append(fpath)
+
+        workers = max_workers if max_workers is not None else DEFAULT_MAX_WORKERS
         indexed = 0
         errors = 0
+        done_count = skipped  # already-skipped count toward progress
 
-        for i, fpath in enumerate(files):
+        if to_process:
+            indexed, errors = self._index_parallel(
+                to_process,
+                total=total,
+                already_done=skipped,
+                progress_callback=progress_callback,
+                max_workers=workers,
+            )
+        else:
+            # All files up-to-date: fire progress callbacks for display
             if progress_callback:
-                progress_callback(fpath, i + 1, total)
-            try:
-                self.index_file(fpath)
-                indexed += 1
-            except Exception:
-                errors += 1
+                for i, fpath in enumerate(files, 1):
+                    progress_callback(fpath, i, total)
 
         self._save_index()
+        return indexed + skipped, errors
+
+    def _is_up_to_date(self, file_path: str) -> bool:
+        """Return True if the file is already indexed with the same mtime+size."""
+        abs_path = os.path.abspath(file_path)
+        entry = self._index.get(abs_path)
+        if entry is None:
+            return False
+        try:
+            stat = os.stat(abs_path)
+            return (
+                abs(stat.st_mtime - entry.file_mtime) < 1.0
+                and stat.st_size == entry.file_size
+            )
+        except OSError:
+            return False
+
+    def _index_parallel(
+        self,
+        files: List[str],
+        total: int,
+        already_done: int,
+        progress_callback: Optional[Callable[[str, int, int], None]],
+        max_workers: int,
+    ) -> Tuple[int, int]:
+        """Extract files in parallel; return (indexed, errors)."""
+        indexed = 0
+        errors = 0
+        completed = already_done
+
+        # Use a lock to protect shared _index writes from multiple threads
+        import threading
+        lock = threading.Lock()
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_path = {
+                pool.submit(self._extract_single, fpath): fpath
+                for fpath in files
+            }
+
+            batch_dirty = 0  # count since last mid-run save
+
+            for future in as_completed(future_to_path):
+                fpath = future_to_path[future]
+                completed += 1
+
+                try:
+                    entry = future.result()
+                    with lock:
+                        self._index[entry.file_path] = entry
+                    if entry.error:
+                        errors += 1
+                    else:
+                        indexed += 1
+                except Exception:
+                    errors += 1
+
+                if progress_callback:
+                    progress_callback(fpath, completed, total)
+
+                batch_dirty += 1
+                if batch_dirty >= SAVE_BATCH_SIZE:
+                    with lock:
+                        self._save_index()
+                    batch_dirty = 0
+
         return indexed, errors
 
-    def index_file(self, file_path: str) -> IndexEntry:
-        """Index a single file. Raises on fatal error."""
+    def _extract_single(self, file_path: str) -> IndexEntry:
+        """Extract one file and return an IndexEntry. Thread-safe (no shared state)."""
         abs_path = os.path.abspath(file_path)
         ext = Path(abs_path).suffix.lower()
-
         extractor_cls = _EXTRACTOR_MAP.get(ext)
         if extractor_cls is None:
             raise ValueError(f"Unsupported file type: {ext}")
 
+        try:
+            stat = os.stat(abs_path)
+            file_mtime = stat.st_mtime
+            file_size = stat.st_size
+        except OSError:
+            file_mtime = 0.0
+            file_size = 0
+
         extractor = extractor_cls(self.config)
         result: ExtractionResult = extractor.extract(abs_path)
 
-        entry = IndexEntry(
+        return IndexEntry(
             file_path=abs_path,
             file_type=result.file_type,
             filename=result.filename,
@@ -116,8 +231,21 @@ class DrawingSearchEngine:
             title=result.title,
             indexed_at=time.time(),
             error=result.error,
+            file_mtime=file_mtime,
+            file_size=file_size,
         )
-        self._index[abs_path] = entry
+
+    def index_file(self, file_path: str, force: bool = False) -> IndexEntry:
+        """Index a single file. Raises on fatal error.
+
+        If *force=False* and the file is already up-to-date in the index,
+        the cached entry is returned without re-parsing.
+        """
+        if not force and self._is_up_to_date(file_path):
+            return self._index[os.path.abspath(file_path)]
+
+        entry = self._extract_single(file_path)
+        self._index[entry.file_path] = entry
         return entry
 
     def remove_file(self, file_path: str) -> bool:
@@ -232,6 +360,9 @@ class DrawingSearchEngine:
                 with open(self.index_path, "r", encoding="utf-8") as fh:
                     raw = json.load(fh)
                 for k, v in raw.items():
+                    # Back-compat: add mtime/size fields if missing
+                    v.setdefault("file_mtime", 0.0)
+                    v.setdefault("file_size", 0)
                     self._index[k] = IndexEntry(**v)
             except Exception:
                 self._index = {}

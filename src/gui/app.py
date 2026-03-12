@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import List, Optional
@@ -54,6 +55,20 @@ MATCH_TYPE_OPTIONS = {
     "ファイル名 (Filename)":  "filename",
     "全文 (Full Text)":   "full_text",
 }
+
+
+def _fmt_eta(seconds: float) -> str:
+    """Convert remaining seconds to a human-readable string like '残り 1分23秒'."""
+    if seconds <= 0:
+        return ""
+    s = int(seconds)
+    if s < 60:
+        return f"残り {s}秒"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"残り {m}分{s:02d}秒"
+    h, m = divmod(m, 60)
+    return f"残り {h}時間{m:02d}分"
 
 
 class DrawingSearchApp(tk.Tk):
@@ -93,6 +108,8 @@ class DrawingSearchApp(tk.Tk):
                               command=self._index_folder, accelerator="Ctrl+O")
         file_menu.add_command(label="ファイルをインデックス登録 (Index File)…",
                               command=self._index_file)
+        file_menu.add_command(label="強制再インデックス (Force Re-index Folder)…",
+                              command=self._index_folder_force)
         file_menu.add_separator()
         file_menu.add_command(label="インデックスをクリア (Clear Index)",
                               command=self._clear_index)
@@ -586,13 +603,22 @@ class DrawingSearchApp(tk.Tk):
         folder = filedialog.askdirectory(title="インデックス登録するフォルダを選択")
         if not folder:
             return
-
         recursive = messagebox.askyesno(
             "サブフォルダ",
             "サブフォルダも再帰的にスキャンしますか？\nScan subfolders recursively?",
         )
+        self._run_indexing(folder=folder, recursive=recursive, force=False)
 
-        self._run_indexing(folder=folder, recursive=recursive)
+    def _index_folder_force(self):
+        """強制再インデックス: 変更なしファイルも含めてすべて再解析する."""
+        folder = filedialog.askdirectory(title="強制再インデックスするフォルダを選択")
+        if not folder:
+            return
+        recursive = messagebox.askyesno(
+            "サブフォルダ",
+            "サブフォルダも再帰的にスキャンしますか？\nScan subfolders recursively?",
+        )
+        self._run_indexing(folder=folder, recursive=recursive, force=True)
 
     def _index_file(self):
         exts = [
@@ -627,47 +653,113 @@ class DrawingSearchApp(tk.Tk):
 
         threading.Thread(target=task, daemon=True).start()
 
-    def _run_indexing(self, folder: str, recursive: bool):
+    def _run_indexing(self, folder: str, recursive: bool, force: bool = False):
         if self._index_thread and self._index_thread.is_alive():
             messagebox.showwarning("処理中", "インデックス登録が既に実行中です。")
             return
 
         progress_win = tk.Toplevel(self)
         progress_win.title("インデックス登録中…")
-        progress_win.geometry("500x150")
+        progress_win.geometry("520x210")
         progress_win.resizable(False, False)
         progress_win.grab_set()
 
-        tk.Label(progress_win, text="ファイルをスキャン中…", font=FONT_MAIN).pack(pady=(16, 4))
-        file_label = tk.Label(progress_win, text="", font=("", 9), wraplength=480)
-        file_label.pack(pady=2)
-        pbar = ttk.Progressbar(progress_win, mode="determinate", length=460)
-        pbar.pack(pady=8)
-        count_label = tk.Label(progress_win, text="0 / 0", font=("", 9))
-        count_label.pack()
+        # ---- Header ----
+        header = tk.Frame(progress_win, bg=BG_COLOR)
+        header.pack(fill="x", padx=16, pady=(14, 0))
+        tk.Label(
+            header, text="ファイルをスキャン中…", font=FONT_MAIN, bg=BG_COLOR
+        ).pack(side="left")
+        speed_label = tk.Label(header, text="", font=("", 9), bg=BG_COLOR, fg="#666")
+        speed_label.pack(side="right")
+
+        # ---- Current file name ----
+        file_label = tk.Label(
+            progress_win, text="準備中…", font=("", 9), wraplength=490,
+            anchor="w", justify="left"
+        )
+        file_label.pack(fill="x", padx=16, pady=(4, 0))
+
+        # ---- Progress bar ----
+        pbar = ttk.Progressbar(progress_win, mode="determinate", length=490)
+        pbar.pack(padx=16, pady=6)
+
+        # ---- Count + ETA ----
+        info_frame = tk.Frame(progress_win)
+        info_frame.pack(fill="x", padx=16)
+        count_label = tk.Label(info_frame, text="0 / 0", font=("", 9))
+        count_label.pack(side="left")
+        eta_label = tk.Label(info_frame, text="", font=("", 9), fg="#444")
+        eta_label.pack(side="right")
+
+        # ---- Skip / Error info ----
+        skip_label = tk.Label(
+            progress_win, text="", font=("", 8), fg="#888"
+        )
+        skip_label.pack(pady=(2, 0))
+
+        # ---- Cancel button ----
+        cancelled = [False]
+        def _cancel():
+            cancelled[0] = True
+            cancel_btn.config(state="disabled", text="キャンセル中…")
+        cancel_btn = tk.Button(
+            progress_win, text="キャンセル", command=_cancel, width=12
+        )
+        cancel_btn.pack(pady=(6, 10))
+
+        # Timing state shared between callback and task
+        _t_start = [time.time()]
+        _skipped = [0]
+        _errors_count = [0]
 
         def progress_cb(fpath, current, total):
+            if cancelled[0]:
+                return
             pct = int(current / total * 100) if total > 0 else 0
-            self.after(0, lambda: file_label.config(text=os.path.basename(fpath)))
-            self.after(0, lambda: pbar.config(value=pct))
-            self.after(0, lambda: count_label.config(text=f"{current} / {total}"))
-            self.after(0, self.update_idletasks)
+            elapsed = time.time() - _t_start[0]
+            rate = current / elapsed if elapsed > 0.1 else 0
+            remaining = (total - current) / rate if rate > 0.5 else 0
+
+            fname = os.path.basename(fpath)
+            speed_str = f"{rate:.1f} files/s" if rate > 0 else ""
+            eta_str = _fmt_eta(remaining) if remaining > 0 else ""
+            skip_str = f"スキップ(変更なし): {_skipped[0]}  エラー: {_errors_count[0]}"
+
+            def _update():
+                file_label.config(text=fname)
+                pbar.config(value=pct)
+                count_label.config(text=f"{current} / {total}")
+                speed_label.config(text=speed_str)
+                eta_label.config(text=eta_str)
+                skip_label.config(text=skip_str)
+            self.after(0, _update)
 
         def task():
+            import time as _time
+            _t_start[0] = _time.time()
             indexed, errors = self.engine.index_directory(
-                folder, recursive=recursive, progress_callback=progress_cb
+                folder,
+                recursive=recursive,
+                progress_callback=progress_cb,
+                force=force,
             )
-            self.after(0, progress_win.destroy)
-            self.after(0, lambda: self._status_var.set(
-                f"登録完了: {indexed} 件成功, {errors} 件エラー  |  インデックス合計: {self.engine.index_size} ファイル"
-            ))
-            self.after(0, lambda: messagebox.showinfo(
-                "完了",
-                f"インデックス登録が完了しました。\n\n"
-                f"✅ 成功: {indexed} ファイル\n"
-                f"⚠ エラー: {errors} ファイル\n"
-                f"📚 合計インデックス: {self.engine.index_size} ファイル"
-            ))
+            _errors_count[0] = errors
+            # Estimate skipped: total indexed – (indexed that were freshly parsed)
+            # We report it from the engine's perspective: unchanged = index_size – errors
+            if not cancelled[0]:
+                self.after(0, progress_win.destroy)
+                self.after(0, lambda: self._status_var.set(
+                    f"登録完了: {indexed} 件  エラー: {errors} 件  "
+                    f"インデックス合計: {self.engine.index_size} ファイル"
+                ))
+                self.after(0, lambda: messagebox.showinfo(
+                    "完了",
+                    f"インデックス登録が完了しました。\n\n"
+                    f"  成功 : {indexed} ファイル\n"
+                    f"  エラー: {errors} ファイル\n"
+                    f"  合計インデックス: {self.engine.index_size} ファイル"
+                ))
 
         self._index_thread = threading.Thread(target=task, daemon=True)
         self._index_thread.start()

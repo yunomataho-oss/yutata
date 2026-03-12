@@ -297,3 +297,70 @@ class TestSearchEngine:
         indexed, errors = engine.index_directory(str(tmp_path), recursive=True)
         assert indexed == 2
         assert errors == 0
+
+    def test_incremental_skip(self, tmp_path):
+        """2nd index run with no changes should skip all files (fast path)."""
+        pytest.importorskip("ezdxf")
+        dxf_path = str(tmp_path / "inc.dxf")
+        _make_dxf_file(dxf_path, "INC-001")
+        index_path = str(tmp_path / "idx.json")
+
+        from src.search.search_engine import DrawingSearchEngine
+        import time as _time
+
+        # First run: parse file
+        e1 = DrawingSearchEngine(index_path=index_path)
+        ok1, err1 = e1.index_directory(str(tmp_path))
+        assert ok1 == 1 and err1 == 0
+
+        # Second run: file unchanged -> should be near-instant
+        e2 = DrawingSearchEngine(index_path=index_path)
+        t0 = _time.time()
+        ok2, err2 = e2.index_directory(str(tmp_path))
+        elapsed = _time.time() - t0
+        assert ok2 == 1 and err2 == 0
+        assert elapsed < 0.5, f"2nd run took {elapsed:.3f}s — expected <0.5s (incremental)"
+
+    def test_force_reindex(self, tmp_path):
+        """force=True should re-parse even unchanged files."""
+        pytest.importorskip("ezdxf")
+        dxf_path = str(tmp_path / "force.dxf")
+        _make_dxf_file(dxf_path, "FORCE-001")
+        index_path = str(tmp_path / "idx.json")
+
+        from src.search.search_engine import DrawingSearchEngine
+
+        e1 = DrawingSearchEngine(index_path=index_path)
+        e1.index_directory(str(tmp_path))
+
+        # Modify indexed_at to check it gets updated
+        abs_path = list(e1._index.keys())[0]
+        old_ts = e1._index[abs_path].indexed_at
+
+        import time as _time
+        _time.sleep(0.05)  # ensure clock advances
+
+        e2 = DrawingSearchEngine(index_path=index_path)
+        e2.index_directory(str(tmp_path), force=True)
+        new_ts = e2._index[abs_path].indexed_at
+        assert new_ts > old_ts, "force=True should re-parse and update indexed_at"
+
+    def test_parallel_indexing(self, tmp_path):
+        """Parallel indexing with multiple workers should yield correct results."""
+        pytest.importorskip("ezdxf")
+        import time as _time
+
+        for i in range(10):
+            _make_dxf_file(str(tmp_path / f"p{i:02d}.dxf"), f"PAR-{i:04d}")
+
+        index_path = str(tmp_path / "idx.json")
+        from src.search.search_engine import DrawingSearchEngine
+
+        engine = DrawingSearchEngine(index_path=index_path)
+        ok, err = engine.index_directory(str(tmp_path), max_workers=4)
+        assert ok == 10
+        assert err == 0
+        # All drawing numbers should be searchable
+        for i in range(10):
+            results = engine.search(f"PAR-{i:04d}")
+            assert len(results) >= 1, f"PAR-{i:04d} not found after parallel index"
