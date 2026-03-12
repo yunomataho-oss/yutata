@@ -31,11 +31,13 @@ DEFAULT_CONFIG_PATH = os.path.join(
 )
 
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "index_path": os.path.join(os.path.expanduser("~"), ".drawing_search", "index.json"),
-    "oda_converter_path": "",        # path to ODAFileConverter executable
-    "drawing_number_patterns": [],   # user-defined extra regex patterns
-    "scan_recursive": True,
-    "log_level": "INFO",
+    "index_path":              os.path.join(os.path.expanduser("~"), ".drawing_search", "index.json"),
+    "oda_path":                "",      # ODAFileConverter 実行ファイルの絶対パス
+    "oda_version":             "ACAD2018",  # 変換先バージョン
+    "oda_audit":               True,    # 変換時に Audit を実行するか
+    "drawing_number_patterns": [],      # ユーザー定義の追加 Regex パターン
+    "scan_recursive":          True,
+    "log_level":               "INFO",
 }
 
 

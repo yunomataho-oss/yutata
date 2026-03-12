@@ -32,6 +32,8 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from src.search.search_engine import DrawingSearchEngine, IndexEntry, SearchResult
+from src.utils.helpers import load_config, save_config
+from src.extractors.dwg_extractor import find_oda_executable, is_oda_installed
 
 
 WINDOW_TITLE  = "図面番号検索アプリ  Drawing Number Search"
@@ -59,7 +61,8 @@ class DrawingSearchApp(tk.Tk):
         self.minsize(800, 550)
         self.configure(bg=BG_COLOR)
 
-        self.engine = DrawingSearchEngine()
+        self._config = load_config()
+        self.engine = DrawingSearchEngine(config=self._config)
         self._results: List[SearchResult] = []
         self._index_thread: Optional[threading.Thread] = None
 
@@ -101,9 +104,18 @@ class DrawingSearchApp(tk.Tk):
                               command=self._show_all_indexed)
         menubar.add_cascade(label="表示 (View)", menu=view_menu)
 
+        # Settings menu
+        settings_menu = tk.Menu(menubar, tearoff=0)
+        settings_menu.add_command(label="ODA File Converter 設定…",
+                                   command=self._open_oda_settings)
+        settings_menu.add_command(label="ODA 接続テスト (Check ODA)",
+                                   command=self._check_oda)
+        menubar.add_cascade(label="設定 (Settings)", menu=settings_menu)
+
         # Help menu
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="使い方 (How to Use)", command=self._show_help)
+        help_menu.add_command(label="ODA 連携ガイド",     command=self._show_oda_guide)
         help_menu.add_command(label="バージョン情報 (About)", command=self._show_about)
         menubar.add_cascade(label="ヘルプ (Help)", menu=help_menu)
 
@@ -552,6 +564,212 @@ class DrawingSearchApp(tk.Tk):
 
     def _on_close(self):
         self.destroy()
+
+    # ------------------------------------------------------------------ #
+    #  ODA Settings & Diagnostics                                          #
+    # ------------------------------------------------------------------ #
+
+    def _open_oda_settings(self):
+        """ODA File Converter のパスを GUI から設定するダイアログ。"""
+        win = tk.Toplevel(self)
+        win.title("ODA File Converter 設定")
+        win.geometry("620x340")
+        win.resizable(False, False)
+        win.grab_set()
+
+        pad = {"padx": 16, "pady": 6}
+
+        # ── 現在の状態表示 ─────────────────────────────────────────
+        current_path = self._config.get("oda_path", "")
+        oda_found    = find_oda_executable(current_path)
+        status_color = "#2e7d32" if oda_found else "#c62828"
+        status_text  = f"✅ 検出: {oda_found}" if oda_found else "❌ 未検出 — パスを手動で設定してください"
+
+        tk.Label(win, text="ODA File Converter の実行ファイルパス",
+                 font=FONT_BOLD).pack(anchor=tk.W, **pad)
+        tk.Label(win, text=status_text, fg=status_color, font=("", 9),
+                 wraplength=580).pack(anchor=tk.W, padx=16)
+
+        # ── パス入力欄 ─────────────────────────────────────────────
+        frm = tk.Frame(win)
+        frm.pack(fill=tk.X, padx=16, pady=8)
+
+        path_var = tk.StringVar(value=current_path)
+        entry = ttk.Entry(frm, textvariable=path_var, width=58)
+        entry.pack(side=tk.LEFT, padx=(0, 6))
+
+        def browse():
+            if sys.platform == "win32":
+                ft = [("実行ファイル", "*.exe"), ("すべて", "*.*")]
+            else:
+                ft = [("すべて", "*")]
+            p = filedialog.askopenfilename(title="ODAFileConverter を選択", filetypes=ft)
+            if p:
+                path_var.set(p)
+
+        ttk.Button(frm, text="参照…", command=browse).pack(side=tk.LEFT)
+
+        # ── バージョン選択 ─────────────────────────────────────────
+        ver_frame = tk.Frame(win)
+        ver_frame.pack(fill=tk.X, padx=16, pady=4)
+        tk.Label(ver_frame, text="変換バージョン:", font=FONT_MAIN).pack(side=tk.LEFT)
+        ver_var = tk.StringVar(value=self._config.get("oda_version", "ACAD2018"))
+        versions = ["ACAD2018", "ACAD2013", "ACAD2010", "ACAD2007", "ACAD2004", "ACAD2000", "ACAD14", "ACAD12"]
+        ttk.Combobox(ver_frame, textvariable=ver_var, values=versions,
+                     state="readonly", width=14).pack(side=tk.LEFT, padx=8)
+        tk.Label(ver_frame, text="(通常は ACAD2018 で問題なし)",
+                 font=("", 9), fg="#555").pack(side=tk.LEFT)
+
+        # ── Audit チェック ─────────────────────────────────────────
+        audit_var = tk.BooleanVar(value=self._config.get("oda_audit", True))
+        ttk.Checkbutton(win, text="変換時に Audit を実行する (推奨)",
+                        variable=audit_var).pack(anchor=tk.W, padx=16, pady=2)
+
+        # ── ダウンロードリンク ──────────────────────────────────────
+        tk.Label(win,
+                 text="📥 未インストールの場合: https://www.opendesign.com/guestfiles/oda_file_converter",
+                 fg="#1565c0", cursor="hand2", font=("", 9)).pack(anchor=tk.W, padx=16, pady=4)
+
+        # ── ボタン ─────────────────────────────────────────────────
+        btn_frame = tk.Frame(win)
+        btn_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=12)
+
+        def test_and_save():
+            p   = path_var.get().strip()
+            ver = ver_var.get()
+            found = find_oda_executable(p)
+            if found:
+                self._config["oda_path"]    = p
+                self._config["oda_version"] = ver
+                self._config["oda_audit"]   = audit_var.get()
+                save_config(self._config)
+                # エンジンに反映
+                self.engine.config.update(self._config)
+                messagebox.showinfo("保存完了",
+                    f"設定を保存しました。\n\n"
+                    f"ODA パス : {found}\n"
+                    f"バージョン: {ver}",
+                    parent=win)
+                win.destroy()
+            else:
+                messagebox.showerror("エラー",
+                    f"ODA File Converter が見つかりません:\n{p or '(空)'}",
+                    parent=win)
+
+        def save_only():
+            self._config["oda_path"]    = path_var.get().strip()
+            self._config["oda_version"] = ver_var.get()
+            self._config["oda_audit"]   = audit_var.get()
+            save_config(self._config)
+            self.engine.config.update(self._config)
+            win.destroy()
+
+        ttk.Button(btn_frame, text="テスト & 保存", command=test_and_save).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_frame, text="保存",          command=save_only).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_frame, text="キャンセル",    command=win.destroy).pack(side=tk.LEFT)
+
+    def _check_oda(self):
+        """ODA の検出状態を詳しく表示する診断ダイアログ。"""
+        custom_path = self._config.get("oda_path", "")
+        oda_exe     = find_oda_executable(custom_path)
+
+        lines = ["─── ODA File Converter 診断レポート ───\n"]
+
+        if oda_exe:
+            lines.append(f"✅ 検出: {oda_exe}\n")
+            # バージョン確認
+            import subprocess
+            try:
+                result = subprocess.run(
+                    [oda_exe, "--version"],
+                    capture_output=True, text=True, timeout=10
+                )
+                ver_out = (result.stdout + result.stderr).strip()
+                if ver_out:
+                    lines.append(f"バージョン情報: {ver_out[:200]}")
+            except Exception as e:
+                lines.append(f"バージョン取得不可 ({e})")
+        else:
+            lines.append("❌ ODA File Converter が見つかりません\n")
+            lines.append("確認した候補パス:")
+            import shutil as _sh, sys as _sys
+            if _sys.platform == "win32":
+                candidates = [
+                    r"C:\Program Files\ODA\ODAFileConverter\ODAFileConverter.exe",
+                    r"C:\Program Files (x86)\ODA\ODAFileConverter\ODAFileConverter.exe",
+                ]
+                for c in candidates:
+                    mark = "✅" if os.path.isfile(c) else "❌"
+                    lines.append(f"  {mark} {c}")
+            found_cmd = _sh.which("ODAFileConverter")
+            lines.append(f"  {'✅' if found_cmd else '❌'} PATH上: ODAFileConverter "
+                         f"({'→ ' + found_cmd if found_cmd else '未発見'})")
+
+        lines.append(f"\n設定ファイルのパス: {custom_path or '(未設定)'}")
+        lines.append(f"設定バージョン    : {self._config.get('oda_version', 'ACAD2018')}")
+        lines.append(f"Audit             : {self._config.get('oda_audit', True)}")
+        lines.append("\n─── インストール方法 ───")
+        lines.append("Windows : https://www.opendesign.com/guestfiles/oda_file_converter")
+        lines.append("          .msi をダウンロードしてインストール")
+        lines.append("Linux   : .deb → sudo gdebi ODAFileConverter*.deb")
+        lines.append("          .rpm → sudo rpm -i ODAFileConverter*.rpm")
+        lines.append("          AppImage → chmod +x *.AppImage で実行可能に")
+        lines.append("macOS   : .dmg をマウントしてインストール")
+        lines.append("\nインストール後、メニュー「設定 > ODA File Converter 設定」でパスを登録してください。")
+
+        win = tk.Toplevel(self)
+        win.title("ODA 診断")
+        win.geometry("680x420")
+        txt = scrolledtext.ScrolledText(win, font=FONT_MONO, wrap=tk.WORD,
+                                         bg="#1e1e1e", fg="#d4d4d4")
+        txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        txt.insert(tk.END, "\n".join(lines))
+        txt.configure(state=tk.DISABLED)
+
+        ttk.Button(win, text="設定を開く",
+                   command=lambda: (win.destroy(), self._open_oda_settings())
+                   ).pack(pady=(0, 8))
+
+    def _show_oda_guide(self):
+        """ODA File Converter の連携手順を表示。"""
+        msg = (
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "  ODA File Converter 連携ガイド\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "【なぜ必要か】\n"
+            "  DWG は Autodesk 独自の非公開フォーマットです。\n"
+            "  ODA File Converter (無料) を使うことで\n"
+            "  DWG → DXF に変換し、高精度なテキスト抽出が可能になります。\n\n"
+            "【STEP 1: ダウンロード】\n"
+            "  https://www.opendesign.com/guestfiles/oda_file_converter\n"
+            "  ※ アカウント不要・完全無料\n\n"
+            "【STEP 2: インストール】\n"
+            "  Windows  → .msi を実行\n"
+            "  Linux    → sudo gdebi ODAFileConverter*.deb\n"
+            "             または sudo rpm -i ODAFileConverter*.rpm\n"
+            "  macOS    → .dmg をマウントして Applications へ\n\n"
+            "【STEP 3: このアプリに登録】\n"
+            "  メニュー「設定 > ODA File Converter 設定」を開き\n"
+            "  インストールした実行ファイルのパスを指定して保存。\n\n"
+            "【デフォルトインストール先】\n"
+            "  Windows: C:\\Program Files\\ODA\\ODAFileConverter\\\n"
+            "           ODAFileConverter.exe\n"
+            "  Linux:   /usr/bin/ODAFileConverter\n"
+            "  macOS:   /Applications/ODAFileConverter.app/\n"
+            "           Contents/MacOS/ODAFileConverter\n\n"
+            "【動作確認】\n"
+            "  メニュー「設定 > ODA 接続テスト」で検出状態を確認できます。\n"
+        )
+        win = tk.Toplevel(self)
+        win.title("ODA 連携ガイド")
+        win.geometry("580x540")
+        txt = scrolledtext.ScrolledText(win, font=FONT_MAIN, wrap=tk.WORD)
+        txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        txt.insert(tk.END, msg)
+        txt.configure(state=tk.DISABLED)
+        ttk.Button(win, text="設定を開く",
+                   command=lambda: (win.destroy(), self._open_oda_settings())
+                   ).pack(pady=(0, 8))
 
 
 # ---------------------------------------------------------------------------#
