@@ -25,6 +25,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import List, Optional
 
+from PIL import Image
+
 # Ensure parent package is importable when running as __main__
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(os.path.dirname(_HERE))
@@ -175,13 +177,19 @@ class DrawingSearchApp(tk.Tk):
         index_btn.pack(side=tk.RIGHT, padx=(0, 10))
 
     def _build_main_panel(self):
-        paned = tk.PanedWindow(self, orient=tk.VERTICAL, sashrelief=tk.RAISED,
-                               sashwidth=5, bg=BG_COLOR)
-        paned.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
+        # ══ 左右水平分割 (結果リスト | プレビュー+詳細) ══
+        h_paned = tk.PanedWindow(self, orient=tk.HORIZONTAL, sashrelief=tk.RAISED,
+                                  sashwidth=5, bg=BG_COLOR)
+        h_paned.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
 
-        # ---- Top: Results treeview ----
-        top_frame = tk.Frame(paned, bg=BG_COLOR)
-        paned.add(top_frame, minsize=200)
+        # ────────── 左ペイン: 結果リスト + 詳細テキスト ──────────────────
+        left_paned = tk.PanedWindow(h_paned, orient=tk.VERTICAL, sashrelief=tk.RAISED,
+                                     sashwidth=5, bg=BG_COLOR)
+        h_paned.add(left_paned, minsize=380)
+
+        # ---- 結果ツリー ----
+        top_frame = tk.Frame(left_paned, bg=BG_COLOR)
+        left_paned.add(top_frame, minsize=180)
 
         result_label = tk.Label(top_frame, text="検索結果 (Results)",
                                 font=FONT_BOLD, bg=BG_COLOR, fg=ACCENT_COLOR)
@@ -194,37 +202,34 @@ class DrawingSearchApp(tk.Tk):
         self._tree.heading("match_type",      text="マッチ種別")
         self._tree.heading("matched",         text="マッチ値/スニペット")
         self._tree.heading("path",            text="パス")
-        self._tree.column("filename",        width=200, minwidth=120)
-        self._tree.column("drawing_numbers", width=180, minwidth=100)
-        self._tree.column("match_type",      width=120, minwidth=80,  anchor=tk.CENTER)
-        self._tree.column("matched",         width=300, minwidth=150)
-        self._tree.column("path",            width=250, minwidth=120)
+        self._tree.column("filename",        width=160, minwidth=100)
+        self._tree.column("drawing_numbers", width=140, minwidth=80)
+        self._tree.column("match_type",      width=90,  minwidth=60,  anchor=tk.CENTER)
+        self._tree.column("matched",         width=200, minwidth=100)
+        self._tree.column("path",            width=200, minwidth=100)
 
         vsb = ttk.Scrollbar(top_frame, orient=tk.VERTICAL,   command=self._tree.yview)
         hsb = ttk.Scrollbar(top_frame, orient=tk.HORIZONTAL, command=self._tree.xview)
         self._tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-
         self._tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        vsb.pack(side=tk.RIGHT,  fill=tk.Y)
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
 
         self._tree.bind("<<TreeviewSelect>>", self._on_result_select)
-        self._tree.bind("<Double-1>", self._open_file)
-
-        # Alternating row colours
+        self._tree.bind("<Double-1>",         self._open_preview_window)
         self._tree.tag_configure("even", background=ROW_EVEN)
         self._tree.tag_configure("odd",  background=ROW_ODD)
 
-        # Right-click context menu
         ctx = tk.Menu(self._tree, tearoff=0)
-        ctx.add_command(label="ファイルを開く (Open File)",     command=self._open_file)
-        ctx.add_command(label="フォルダを開く (Open Folder)",   command=self._open_containing_folder)
-        ctx.add_command(label="パスをコピー (Copy Path)",        command=self._copy_path)
+        ctx.add_command(label="🔍 プレビュー (Preview)",        command=self._open_preview_window)
+        ctx.add_command(label="ファイルを開く (Open File)",      command=self._open_file)
+        ctx.add_command(label="フォルダを開く (Open Folder)",    command=self._open_containing_folder)
+        ctx.add_command(label="パスをコピー (Copy Path)",         command=self._copy_path)
         self._tree.bind("<Button-3>", lambda e: ctx.post(e.x_root, e.y_root))
 
-        # ---- Bottom: Detail panel ----
-        bottom_frame = tk.Frame(paned, bg=BG_COLOR)
-        paned.add(bottom_frame, minsize=120)
+        # ---- 詳細テキスト ----
+        bottom_frame = tk.Frame(left_paned, bg=BG_COLOR)
+        left_paned.add(bottom_frame, minsize=100)
 
         detail_label = tk.Label(bottom_frame, text="詳細情報 (Detail)",
                                 font=FONT_BOLD, bg=BG_COLOR, fg=ACCENT_COLOR)
@@ -232,11 +237,88 @@ class DrawingSearchApp(tk.Tk):
 
         self._detail_text = scrolledtext.ScrolledText(
             bottom_frame, font=FONT_MONO, wrap=tk.WORD,
-            height=8, state=tk.DISABLED,
+            height=7, state=tk.DISABLED,
             bg="#1e1e1e", fg="#d4d4d4",
             insertbackground="white",
         )
         self._detail_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+
+        # ────────── 右ペイン: インラインプレビュー ───────────────────────
+        right_frame = tk.Frame(h_paned, bg="#2b2b2b")
+        h_paned.add(right_frame, minsize=300)
+
+        # プレビューヘッダー
+        prev_header = tk.Frame(right_frame, bg="#37474f", pady=3)
+        prev_header.pack(side=tk.TOP, fill=tk.X)
+
+        tk.Label(prev_header, text="プレビュー (Preview)",
+                 font=FONT_BOLD, bg="#37474f", fg="white").pack(side=tk.LEFT, padx=8)
+
+        # ページ送りボタン
+        self._inline_page_label = tk.Label(prev_header, text="— / —",
+                                            bg="#37474f", fg="white", font=FONT_BOLD)
+        self._inline_page_label.pack(side=tk.LEFT, padx=8)
+
+        tk.Button(prev_header, text="◀", command=self._inline_prev_page,
+                  bg="#546e7a", fg="white", relief=tk.FLAT, padx=4,
+                  cursor="hand2").pack(side=tk.LEFT, padx=2)
+        tk.Button(prev_header, text="▶", command=self._inline_next_page,
+                  bg="#546e7a", fg="white", relief=tk.FLAT, padx=4,
+                  cursor="hand2").pack(side=tk.LEFT, padx=2)
+
+        # 別ウィンドウで開くボタン
+        tk.Button(prev_header, text="⬜ 別ウィンドウ", command=self._open_preview_window,
+                  bg="#1565c0", fg="white", relief=tk.FLAT, padx=6,
+                  cursor="hand2").pack(side=tk.RIGHT, padx=8)
+
+        # ズームボタン
+        tk.Button(prev_header, text="フィット", command=self._inline_fit,
+                  bg="#546e7a", fg="white", relief=tk.FLAT, padx=4,
+                  cursor="hand2").pack(side=tk.RIGHT, padx=2)
+        tk.Button(prev_header, text="＋", command=self._inline_zoom_in,
+                  bg="#546e7a", fg="white", relief=tk.FLAT, padx=4,
+                  cursor="hand2").pack(side=tk.RIGHT, padx=2)
+        tk.Button(prev_header, text="－", command=self._inline_zoom_out,
+                  bg="#546e7a", fg="white", relief=tk.FLAT, padx=4,
+                  cursor="hand2").pack(side=tk.RIGHT, padx=2)
+        self._inline_zoom_label = tk.Label(prev_header, text="100%",
+                                            bg="#37474f", fg="#ffd600", font=FONT_BOLD)
+        self._inline_zoom_label.pack(side=tk.RIGHT, padx=4)
+
+        # キャンバス
+        self._prev_vscroll = tk.Scrollbar(right_frame, orient=tk.VERTICAL)
+        self._prev_hscroll = tk.Scrollbar(right_frame, orient=tk.HORIZONTAL)
+        self._prev_vscroll.pack(side=tk.RIGHT,  fill=tk.Y)
+        self._prev_hscroll.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self._preview_canvas = tk.Canvas(
+            right_frame, bg="#2b2b2b", highlightthickness=0,
+            yscrollcommand=self._prev_vscroll.set,
+            xscrollcommand=self._prev_hscroll.set,
+            cursor="fleur",
+        )
+        self._preview_canvas.pack(fill=tk.BOTH, expand=True)
+        self._prev_vscroll.config(command=self._preview_canvas.yview)
+        self._prev_hscroll.config(command=self._preview_canvas.xview)
+
+        # プレビュー状態変数
+        self._inline_pages:   list = []
+        self._inline_tk_img   = None   # GC 防止
+        self._inline_current  = 0
+        self._inline_zoom     = 1.0
+
+        # キャンバスドラッグ
+        self._preview_canvas.bind("<ButtonPress-1>",  self._prev_drag_start)
+        self._preview_canvas.bind("<B1-Motion>",       self._prev_drag_move)
+        self._preview_canvas.bind("<MouseWheel>",      self._prev_wheel)
+        self._preview_canvas.bind("<Button-4>",        self._prev_wheel)
+        self._preview_canvas.bind("<Button-5>",        self._prev_wheel)
+        self._preview_canvas.bind("<Control-MouseWheel>", self._prev_ctrl_wheel)
+        self._preview_canvas.bind("<Control-Button-4>",   self._prev_ctrl_wheel)
+        self._preview_canvas.bind("<Control-Button-5>",   self._prev_ctrl_wheel)
+
+        # 初期メッセージ
+        self._show_preview_placeholder("図面を選択するとプレビューが表示されます")
 
     def _build_status_bar(self):
         self._status_var = tk.StringVar()
@@ -315,6 +397,8 @@ class DrawingSearchApp(tk.Tk):
             return
         result = self._results[idx]
         self._show_detail(result)
+        # インラインプレビューを非同期でロード
+        self._load_inline_preview(result.entry.file_path)
 
     def _show_detail(self, result: SearchResult):
         entry = result.entry
@@ -345,8 +429,158 @@ class DrawingSearchApp(tk.Tk):
         self._detail_text.configure(state=tk.DISABLED)
 
     # ------------------------------------------------------------------ #
-    #  Indexing                                                            #
+    #  Inline Preview Methods                                              #
     # ------------------------------------------------------------------ #
+
+    def _show_preview_placeholder(self, message: str):
+        """プレビューキャンバスにメッセージを表示する。"""
+        self._preview_canvas.delete("all")
+        w = max(self._preview_canvas.winfo_width(),  300)
+        h = max(self._preview_canvas.winfo_height(), 200)
+        self._preview_canvas.create_text(
+            w // 2, h // 2,
+            text=message, fill="#546e7a",
+            font=("Helvetica", 13), justify=tk.CENTER,
+        )
+
+    def _load_inline_preview(self, file_path: str):
+        """バックグラウンドスレッドでプレビュー画像を生成する。"""
+        self._show_preview_placeholder("🔄 レンダリング中...")
+        self._inline_pages   = []
+        self._inline_current = 0
+        self._inline_zoom    = 1.0
+
+        def worker():
+            from src.preview.preview_engine import get_preview
+            try:
+                pages = get_preview(file_path, self._config, max_pages=30)
+            except Exception as exc:
+                from src.preview.preview_engine import _make_error_image
+                pages = [_make_error_image("プレビューエラー", str(exc))]
+            self.after(0, lambda: self._on_inline_loaded(pages, file_path))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_inline_loaded(self, pages, file_path: str):
+        self._inline_pages   = pages
+        self._inline_current = 0
+        self._inline_zoom    = 1.0
+        self._draw_inline_page()
+
+    def _draw_inline_page(self):
+        """現在のページをインラインキャンバスに描画する。"""
+        if not self._inline_pages:
+            return
+
+        idx = self._inline_current
+        img = self._inline_pages[idx]
+
+        # ウィンドウ幅に合わせて自動フィット（初回のみ zoom=1 → fit に調整）
+        cw = max(self._preview_canvas.winfo_width(),  300)
+        ch = max(self._preview_canvas.winfo_height(), 200)
+        if self._inline_zoom == 1.0:
+            zw = cw / img.width
+            zh = ch / img.height
+            self._inline_zoom = min(zw, zh) * 0.97
+
+        new_w = max(1, int(img.width  * self._inline_zoom))
+        new_h = max(1, int(img.height * self._inline_zoom))
+        resized = img.resize((new_w, new_h), Image.LANCZOS)
+
+        from PIL import ImageTk
+        self._inline_tk_img = ImageTk.PhotoImage(resized)   # GC 防止
+
+        self._preview_canvas.delete("all")
+        self._preview_canvas.create_image(0, 0, anchor=tk.NW,
+                                           image=self._inline_tk_img)
+        self._preview_canvas.configure(scrollregion=(0, 0, new_w, new_h))
+        self._preview_canvas.xview_moveto(0)
+        self._preview_canvas.yview_moveto(0)
+
+        total = len(self._inline_pages)
+        layout = img.info.get("layout_name", f"ページ {idx + 1}")
+        self._inline_page_label.config(text=f"{idx + 1} / {total}")
+        self._inline_zoom_label.config(text=f"{int(self._inline_zoom * 100)}%")
+        self._status_var.set(
+            f"{layout}  |  ズーム: {int(self._inline_zoom * 100)}%  |  "
+            "Ctrl+ホイールでズーム / ドラッグでスクロール / ダブルクリックで別ウィンドウ"
+        )
+
+    def _inline_prev_page(self):
+        if self._inline_current > 0:
+            self._inline_current -= 1
+            self._inline_zoom = 1.0
+            self._draw_inline_page()
+
+    def _inline_next_page(self):
+        if self._inline_pages and self._inline_current < len(self._inline_pages) - 1:
+            self._inline_current += 1
+            self._inline_zoom = 1.0
+            self._draw_inline_page()
+
+    def _inline_zoom_in(self):
+        self._inline_zoom = min(4.0, self._inline_zoom + 0.15)
+        self._redraw_inline()
+
+    def _inline_zoom_out(self):
+        self._inline_zoom = max(0.1, self._inline_zoom - 0.15)
+        self._redraw_inline()
+
+    def _inline_fit(self):
+        self._inline_zoom = 1.0   # trigger auto-fit in draw
+        self._draw_inline_page()
+
+    def _redraw_inline(self):
+        if not self._inline_pages:
+            return
+        idx = self._inline_current
+        img = self._inline_pages[idx]
+        new_w = max(1, int(img.width  * self._inline_zoom))
+        new_h = max(1, int(img.height * self._inline_zoom))
+        resized = img.resize((new_w, new_h), Image.LANCZOS)
+        from PIL import ImageTk
+        self._inline_tk_img = ImageTk.PhotoImage(resized)
+        self._preview_canvas.delete("all")
+        self._preview_canvas.create_image(0, 0, anchor=tk.NW, image=self._inline_tk_img)
+        self._preview_canvas.configure(scrollregion=(0, 0, new_w, new_h))
+        self._inline_zoom_label.config(text=f"{int(self._inline_zoom * 100)}%")
+
+    def _prev_drag_start(self, event):
+        self._preview_canvas.scan_mark(event.x, event.y)
+
+    def _prev_drag_move(self, event):
+        self._preview_canvas.scan_dragto(event.x, event.y, gain=1)
+
+    def _prev_wheel(self, event):
+        if sys.platform == "win32":
+            delta = -1 if event.delta < 0 else 1
+        else:
+            delta = -1 if event.num == 5 else 1
+        self._preview_canvas.yview_scroll(-delta, "units")
+
+    def _prev_ctrl_wheel(self, event):
+        if sys.platform == "win32":
+            delta = event.delta
+        else:
+            delta = -120 if event.num == 5 else 120
+        if delta > 0:
+            self._inline_zoom_in()
+        else:
+            self._inline_zoom_out()
+
+    def _open_preview_window(self, *_):
+        """選択中ファイルを別ウィンドウで大きく表示する。"""
+        sel = self._tree.selection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        if idx >= len(self._results):
+            return
+        file_path = self._results[idx].entry.file_path
+        query     = self._search_var.get().strip()
+
+        from src.preview.preview_panel import PreviewWindow
+        PreviewWindow(self, file_path, config=self._config, highlight_text=query)
 
     def _index_folder(self):
         folder = filedialog.askdirectory(title="インデックス登録するフォルダを選択")

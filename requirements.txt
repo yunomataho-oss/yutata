@@ -1,2 +1,4 @@
 PyMuPDF>=1.23.0
 ezdxf>=1.1.0
+matplotlib>=3.7.0
+Pillow>=10.0.0
