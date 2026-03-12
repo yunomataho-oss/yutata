@@ -25,7 +25,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import List, Optional
 
-from PIL import Image
+# PIL / Pillow は使用箇所で遅延 import する。
+# トップレベルで import すると PIL 未インストール時に起動自体が失敗するため。
 
 # Ensure parent package is importable when running as __main__
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -485,9 +486,8 @@ class DrawingSearchApp(tk.Tk):
 
         new_w = max(1, int(img.width  * self._inline_zoom))
         new_h = max(1, int(img.height * self._inline_zoom))
-        resized = img.resize((new_w, new_h), Image.LANCZOS)
-
-        from PIL import ImageTk
+        from PIL import Image as _Image, ImageTk
+        resized = img.resize((new_w, new_h), _Image.LANCZOS)
         self._inline_tk_img = ImageTk.PhotoImage(resized)   # GC 防止
 
         self._preview_canvas.delete("all")
@@ -537,8 +537,8 @@ class DrawingSearchApp(tk.Tk):
         img = self._inline_pages[idx]
         new_w = max(1, int(img.width  * self._inline_zoom))
         new_h = max(1, int(img.height * self._inline_zoom))
-        resized = img.resize((new_w, new_h), Image.LANCZOS)
-        from PIL import ImageTk
+        from PIL import Image as _Image, ImageTk
+        resized = img.resize((new_w, new_h), _Image.LANCZOS)
         self._inline_tk_img = ImageTk.PhotoImage(resized)
         self._preview_canvas.delete("all")
         self._preview_canvas.create_image(0, 0, anchor=tk.NW, image=self._inline_tk_img)
