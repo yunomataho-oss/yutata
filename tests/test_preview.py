@@ -188,3 +188,77 @@ class TestPreviewEngine:
         from src.preview.preview_engine import get_preview
         pages = get_preview(path, max_pages=3)
         assert len(pages) <= 3
+
+    # ── バグ修正検証テスト ──────────────────────────────────────────────
+
+    def test_dxf_white_background(self, tmp_path):
+        """DXF プレビューは白背景 (Bright% > 50%) で返される。
+        旧コードではデフォルト黒背景 (#212830) のまま描画され
+        ほぼ真っ黒な画像が出力されていた。"""
+        pytest.importorskip("ezdxf")
+        import numpy as np
+        from tests.create_samples import make_dxf as _make_dxf_full
+        path = str(tmp_path / "bg_test.dxf")
+        _make_dxf_full(path, "BG-001", "Background Test")
+        from src.preview.preview_engine import get_preview
+        pages = get_preview(path)
+        assert len(pages) >= 1
+        img = pages[0]
+        assert img.mode == "RGB", f"Expected RGB, got {img.mode}"
+        arr = np.array(img)
+        bright_pct = (arr.mean(axis=2) > 200).mean() * 100
+        dark_pct   = (arr.mean(axis=2) < 50).mean()  * 100
+        assert bright_pct > 50, (
+            f"DXF preview is too dark (bright={bright_pct:.1f}%, dark={dark_pct:.1f}%). "
+            "White background fix may have regressed."
+        )
+        assert dark_pct < 30, (
+            f"DXF preview has too many dark pixels (dark={dark_pct:.1f}%). "
+            "White background fix may have regressed."
+        )
+
+    def test_dxf_output_is_rgb(self, tmp_path):
+        """DXF プレビュー出力は RGB モードでなければならない (RGBA 不可)。
+        旧コードでは matplotlib が RGBA で出力し、アルファチャンネルが
+        Tkinter PhotoImage に渡されて表示がバグる問題があった。"""
+        pytest.importorskip("ezdxf")
+        path = str(tmp_path / "mode_test.dxf")
+        _make_dxf(path, "MODE-001")
+        from src.preview.preview_engine import get_preview
+        pages = get_preview(path)
+        for i, p in enumerate(pages):
+            assert p.mode == "RGB", (
+                f"Page {i} has mode '{p.mode}', expected 'RGB'. "
+                "RGBA to RGB conversion fix may have regressed."
+            )
+
+    def test_dxf_empty_layout_skipped(self, tmp_path):
+        """エンティティが 0 件のレイアウトはプレビューに含まれない。
+        旧コードでは空白ページが出力されていた。"""
+        pytest.importorskip("ezdxf")
+        import ezdxf as _ezdxf
+        path = str(tmp_path / "empty_layout.dxf")
+        doc = _ezdxf.new()
+        # Model には LINE を追加
+        msp = doc.modelspace()
+        msp.add_line((0, 0), (100, 100))
+        # Sheet1 は空のまま
+        doc.layouts.new("Sheet1")
+        doc.saveas(path)
+        from src.preview.preview_engine import preview_dxf
+        pages = preview_dxf(path)
+        # Sheet1 (空) はスキップされ Model だけ
+        assert len(pages) == 1, (
+            f"Expected 1 page (empty layout skipped), got {len(pages)}."
+        )
+        assert pages[0].info.get("layout_name") == "Model"
+
+    def test_pdf_output_is_rgb(self, tmp_path):
+        """PDF プレビュー出力も RGB モードであること。"""
+        pytest.importorskip("fitz")
+        path = str(tmp_path / "pdf_mode.pdf")
+        _make_minimal_pdf(path)
+        from src.preview.preview_engine import get_preview
+        pages = get_preview(path)
+        for i, p in enumerate(pages):
+            assert p.mode == "RGB", f"PDF page {i} mode={p.mode}, expected RGB"
