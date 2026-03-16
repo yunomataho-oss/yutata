@@ -22,6 +22,7 @@ preview_engine.py — 各ファイル形式をサムネイル/プレビュー画
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -114,6 +115,99 @@ class PageResult:
         img.info["layout_name"] = self.layout_name
         img.info["hit_boxes"]   = self.hit_boxes
         return img
+
+
+# ── DWG ディスクキャッシュ ───────────────────────────────────────────────
+# ~/.cache/drawing_search/dwg_preview/ に PNG / DXF を永続キャッシュする。
+# キー: SHA1(file_path + str(mtime))  → 重複変換・再レンダリングを防ぐ
+
+def _dwg_cache_dir() -> str:
+    """DWG キャッシュディレクトリを返す（なければ作成）。"""
+    base = os.path.join(
+        os.path.expanduser("~"), ".cache", "drawing_search", "dwg_preview"
+    )
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def _dwg_cache_key(file_path: str, mtime: float) -> str:
+    """(ファイルパス, mtime) → 16文字の16進数ハッシュ文字列。"""
+    raw = f"{os.path.abspath(file_path)}|{mtime:.6f}"
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+
+def _dwg_dxf_cache_path(key: str) -> str:
+    """DXF 中間ファイルのキャッシュパスを返す。"""
+    return os.path.join(_dwg_cache_dir(), f"{key}.dxf")
+
+
+def _dwg_png_cache_path(key: str, layout_name: str = "__default__") -> str:
+    """PNG サムネイルのキャッシュパスを返す。"""
+    safe = layout_name.replace("/", "_").replace("\\", "_").replace(" ", "_")
+    return os.path.join(_dwg_cache_dir(), f"{key}_{safe}.png")
+
+
+def _dwg_cache_purge(max_entries: int = 200) -> None:
+    """
+    キャッシュが max_entries を超えたら古いファイルを削除する。
+    200 ファイル × 平均 100 KB ≈ 20 MB が目安。
+    """
+    cache_dir = _dwg_cache_dir()
+    try:
+        files = [
+            (os.path.getmtime(os.path.join(cache_dir, f)), os.path.join(cache_dir, f))
+            for f in os.listdir(cache_dir)
+            if os.path.isfile(os.path.join(cache_dir, f))
+        ]
+        if len(files) > max_entries:
+            files.sort()  # 古い順
+            for _, fp in files[: len(files) - max_entries]:
+                try:
+                    os.remove(fp)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+# ── ODA subprocess ヘルパー ───────────────────────────────────────────────
+
+def _run_oda_subprocess(
+    oda_exe: str,
+    tmp_in: str,
+    tmp_out: str,
+    version: str = "ACAD2018",
+    audit: str = "0",
+    timeout: int = 30,
+) -> None:
+    """
+    ODA File Converter を低優先度プロセスとして実行する。
+
+    CPU 負荷対策:
+      - Windows: CREATE_NO_WINDOW + BELOW_NORMAL_PRIORITY_CLASS
+      - Linux/macOS: nice +10 でバックグラウンド優先度に下げる
+    タイムアウト: デフォルト 30 秒（旧実装の 120 秒から短縮）
+    """
+    env = _ensure_display_env()
+    cmd = [oda_exe, tmp_in, tmp_out, version, "DXF", "0", audit]
+
+    if sys.platform == "win32":
+        kwargs: dict = dict(
+            timeout=timeout,
+            capture_output=True,
+            env=env,
+            # コンソール非表示 + CPU 優先度: BELOW_NORMAL (0x4000)
+            creationflags=subprocess.CREATE_NO_WINDOW | 0x4000,
+        )
+    else:
+        # xvfb-run でヘッドレス対応 + nice +10 で低優先度
+        if shutil.which("xvfb-run"):
+            cmd = ["xvfb-run", "-a"] + cmd
+        if shutil.which("nice"):
+            cmd = ["nice", "-n", "10"] + cmd
+        kwargs = dict(timeout=timeout, capture_output=True, env=env)
+
+    subprocess.run(cmd, **kwargs)
 
 
 # ── プレースホルダー生成 ──────────────────────────────────────────────────
@@ -322,123 +416,248 @@ def _ensure_display_env() -> dict:
     return env
 
 
+def _render_dwg_from_dxf(
+    dxf_path: str,
+    target_layout: Optional[str],
+    cache_key: str,
+) -> List[PageResult]:
+    """
+    変換済み DXF ファイルを読み込み、レイアウトをレンダリングする。
+    PNG サムネイルをディスクにキャッシュして再利用する。
+
+    target_layout が指定された場合は 1 枚のみレンダリングする。
+    """
+    try:
+        import ezdxf
+    except ImportError:
+        return [PageResult(_make_error_image("ezdxf 未インストール", "pip install ezdxf"))]
+
+    try:
+        try:
+            doc = ezdxf.readfile(dxf_path)
+        except Exception:
+            import ezdxf.recover as recover
+            doc, _ = recover.readfile(dxf_path)
+    except Exception as exc:
+        return [PageResult(_make_error_image("DXF 読み込みエラー", str(exc)))]
+
+    all_names  = list(doc.layouts.names())
+    paper      = [n for n in all_names if n != "Model"]
+    model      = [n for n in all_names if n == "Model"]
+    candidates = paper + model
+
+    # target_layout 指定時は一致するレイアウトのみ
+    if target_layout is not None:
+        candidates = [n for n in candidates if n == target_layout] or candidates[:1]
+
+    results: List[PageResult] = []
+    for name in candidates:
+        layout = doc.layouts.get(name)
+        if _count_visible_entities(layout) == 0:
+            continue
+
+        # ── PNG キャッシュ確認 ───────────────────────────────────────
+        png_path = _dwg_png_cache_path(cache_key, name)
+        if os.path.isfile(png_path):
+            try:
+                img = Image.open(png_path).copy()   # copy で PIL ファイルロックを解放
+                pr  = PageResult(image=img, layout_name=name)
+                results.append(pr)
+                continue
+            except Exception:
+                pass  # 壊れたキャッシュは無視して再レンダリング
+
+        # ── レンダリング ─────────────────────────────────────────────
+        try:
+            pr = _render_dxf_layout_svg(doc, layout)
+            pr.layout_name = name
+            pr.image.info["layout_name"] = name
+
+            # PNG キャッシュに保存（失敗しても続行）
+            try:
+                pr.image.save(png_path, format="PNG", optimize=True)
+            except Exception:
+                pass
+
+            results.append(pr)
+        except Exception as exc:
+            results.append(PageResult(
+                _make_error_image(f"レイアウト '{name}' レンダリング失敗", str(exc)),
+                layout_name=name,
+            ))
+
+    if not results:
+        return [PageResult(_make_placeholder("DWG: 描画可能なレイアウトなし"))]
+    return results
+
+
 def preview_dwg(
     file_path: str,
     config: Optional[dict] = None,
+    target_layout: Optional[str] = None,
     highlight_text: str = "",
 ) -> List[PageResult]:
-    config = config or {}
+    """
+    DWG プレビューを生成する。
+
+    高速化ポイント:
+      1. DXF 中間ファイルをディスクキャッシュ → 2 回目以降 ODA 変換をスキップ
+      2. PNG サムネイルをディスクキャッシュ → 再起動後も再利用
+      3. ODA subprocess を低優先度で実行 (BELOW_NORMAL / nice +10)
+      4. ODA タイムアウトを 30 秒に短縮 (旧: 120 秒)
+      5. target_layout 指定時は指定レイアウトのみレンダリング
+    """
+    config     = config or {}
     audit_flag = bool(config.get("oda_audit", True))
+    oda_timeout = int(config.get("oda_timeout", 30))  # デフォルト 30 秒
 
+    # ── キャッシュキー ────────────────────────────────────────────────
     try:
-        import ezdxf
-        from ezdxf.addons import odafc
+        mtime = os.path.getmtime(file_path)
+    except OSError:
+        mtime = 0.0
+    cache_key = _dwg_cache_key(file_path, mtime)
 
-        custom = config.get("oda_path", "")
+    # ── DXF 中間ファイルキャッシュ確認 ───────────────────────────────
+    dxf_cache = _dwg_dxf_cache_path(cache_key)
+    if os.path.isfile(dxf_cache):
+        # キャッシュ済み DXF → ODA 変換スキップ、直接レンダリング
+        return _render_dwg_from_dxf(dxf_cache, target_layout, cache_key)
+
+    # ── ODA 経由で変換 ───────────────────────────────────────────────
+    try:
+        from src.extractors.dwg_extractor import find_oda_executable
+    except ImportError:
+        find_oda_executable = lambda p: p if p and os.path.isfile(p) else None  # noqa: E731
+
+    oda_exe = find_oda_executable(config.get("oda_path", ""))
+
+    # ── 方法 1: ezdxf.addons.odafc (メモリ経由) ──────────────────────
+    if oda_exe:
         try:
-            from src.extractors.dwg_extractor import find_oda_executable as _find_oda
-            oda_exe_found = _find_oda(custom)
-        except ImportError:
-            oda_exe_found = custom if custom and os.path.isfile(custom) else None
+            import ezdxf
+            from ezdxf.addons import odafc
 
-        if oda_exe_found:
             if sys.platform == "win32":
-                ezdxf.options.set("odafc-addon", "win_exec_path",  oda_exe_found)
+                ezdxf.options.set("odafc-addon", "win_exec_path",  oda_exe)
             else:
-                ezdxf.options.set("odafc-addon", "unix_exec_path", oda_exe_found)
+                ezdxf.options.set("odafc-addon", "unix_exec_path", oda_exe)
 
-        old_display = os.environ.get("DISPLAY")
-        display_env = _ensure_display_env()
-        try:
-            if sys.platform != "win32" and not os.environ.get("DISPLAY"):
-                os.environ["DISPLAY"] = display_env["DISPLAY"]
+            old_display = os.environ.get("DISPLAY")
+            display_env = _ensure_display_env()
+            try:
+                if sys.platform != "win32" and not os.environ.get("DISPLAY"):
+                    os.environ["DISPLAY"] = display_env["DISPLAY"]
 
-            if odafc.is_installed():
-                try:
-                    doc = odafc.readfile(file_path, audit=audit_flag)
-                except Exception:
-                    if audit_flag and sys.platform == "win32":
-                        doc = odafc.readfile(file_path, audit=False)
-                    else:
-                        raise
-
-                all_names = list(doc.layouts.names())
-                paper     = [n for n in all_names if n != "Model"]
-                model     = [n for n in all_names if n == "Model"]
-                results: List[PageResult] = []
-
-                for name in paper + model:
-                    layout = doc.layouts.get(name)
-                    if _count_visible_entities(layout) == 0:
-                        continue
+                if odafc.is_installed():
                     try:
-                        pr = _render_dxf_layout_svg(doc, layout)
-                        pr.layout_name = name
-                        pr.image.info["layout_name"] = name
-                        results.append(pr)
-                    except Exception as exc:
-                        results.append(PageResult(
-                            _make_error_image(f"レイアウト '{name}' レンダリング失敗",
-                                              str(exc)),
-                            layout_name=name,
-                        ))
+                        doc = odafc.readfile(file_path, audit=audit_flag)
+                    except Exception:
+                        if audit_flag and sys.platform == "win32":
+                            doc = odafc.readfile(file_path, audit=False)
+                        else:
+                            raise
 
-                return results if results else [PageResult(
-                    _make_placeholder("DWG: 描画可能なレイアウトなし"))]
+                    all_names = list(doc.layouts.names())
+                    paper     = [n for n in all_names if n != "Model"]
+                    model     = [n for n in all_names if n == "Model"]
+                    candidates = paper + model
+                    if target_layout is not None:
+                        candidates = [n for n in candidates if n == target_layout] or candidates[:1]
 
-        finally:
-            if sys.platform != "win32":
-                if old_display is None:
-                    os.environ.pop("DISPLAY", None)
-                else:
-                    os.environ["DISPLAY"] = old_display
+                    results: List[PageResult] = []
+                    for name in candidates:
+                        layout = doc.layouts.get(name)
+                        if _count_visible_entities(layout) == 0:
+                            continue
 
-    except Exception:
-        pass
+                        png_path = _dwg_png_cache_path(cache_key, name)
+                        if os.path.isfile(png_path):
+                            try:
+                                img = Image.open(png_path).copy()
+                                results.append(PageResult(image=img, layout_name=name))
+                                continue
+                            except Exception:
+                                pass
 
-    # ODA CLI で DXF に変換してからレンダリング
-    try:
-        from src.extractors.dwg_extractor import find_oda_executable, _ensure_display_env as _dwe_display
-        oda_exe = find_oda_executable(config.get("oda_path", ""))
+                        try:
+                            pr = _render_dxf_layout_svg(doc, layout)
+                            pr.layout_name = name
+                            pr.image.info["layout_name"] = name
+                            try:
+                                pr.image.save(png_path, format="PNG", optimize=True)
+                            except Exception:
+                                pass
+                            results.append(pr)
+                        except Exception as exc:
+                            results.append(PageResult(
+                                _make_error_image(f"レイアウト '{name}' レンダリング失敗", str(exc)),
+                                layout_name=name,
+                            ))
 
-        if oda_exe:
+                    _dwg_cache_purge()
+                    return results if results else [PageResult(
+                        _make_placeholder("DWG: 描画可能なレイアウトなし"))]
+
+            finally:
+                if sys.platform != "win32":
+                    if old_display is None:
+                        os.environ.pop("DISPLAY", None)
+                    else:
+                        os.environ["DISPLAY"] = old_display
+
+        except Exception:
+            pass
+
+    # ── 方法 2: ODA CLI → DXF → ディスクキャッシュ → レンダリング ────
+    if oda_exe:
+        try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 tmp_in  = os.path.join(tmpdir, "in")
                 tmp_out = os.path.join(tmpdir, "out")
-                os.makedirs(tmp_in); os.makedirs(tmp_out)
+                os.makedirs(tmp_in)
+                os.makedirs(tmp_out)
                 shutil.copy2(file_path, tmp_in)
 
                 audit_str = "1" if audit_flag else "0"
-                cmd = [oda_exe, tmp_in, tmp_out, "ACAD2018", "DXF", "0", audit_str]
-                env = _dwe_display()
+                try:
+                    _run_oda_subprocess(oda_exe, tmp_in, tmp_out,
+                                        version=config.get("oda_version", "ACAD2018"),
+                                        audit=audit_str, timeout=oda_timeout)
+                except subprocess.TimeoutExpired:
+                    pass  # タイムアウトでも出力を確認
 
-                if sys.platform != "win32" and shutil.which("xvfb-run"):
-                    cmd = ["xvfb-run", "-a"] + cmd
-
-                run_kwargs: dict = dict(timeout=90, capture_output=True, env=env)
-                if sys.platform == "win32":
-                    run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
-                subprocess.run(cmd, **run_kwargs)
-
-                dxf_files = []
+                dxf_files: List[str] = []
                 for root, _, files in os.walk(tmp_out):
                     for f in files:
                         if f.lower().endswith(".dxf"):
                             dxf_files.append(os.path.join(root, f))
 
+                # Windows で audit=1 失敗時は audit=0 でリトライ
                 if not dxf_files and audit_str == "1" and sys.platform == "win32":
-                    cmd2 = [oda_exe, tmp_in, tmp_out, "ACAD2018", "DXF", "0", "0"]
-                    subprocess.run(cmd2, **run_kwargs)
+                    try:
+                        _run_oda_subprocess(oda_exe, tmp_in, tmp_out,
+                                            version=config.get("oda_version", "ACAD2018"),
+                                            audit="0", timeout=oda_timeout)
+                    except subprocess.TimeoutExpired:
+                        pass
                     for root, _, files in os.walk(tmp_out):
                         for f in files:
                             if f.lower().endswith(".dxf"):
                                 dxf_files.append(os.path.join(root, f))
 
                 if dxf_files:
-                    return preview_dxf(dxf_files[0])
-    except Exception:
-        pass
+                    # DXF をキャッシュディレクトリにコピー（次回以降 ODA 不要）
+                    try:
+                        shutil.copy2(dxf_files[0], dxf_cache)
+                        _dwg_cache_purge()
+                    except Exception:
+                        pass
+                    result = _render_dwg_from_dxf(dxf_files[0], target_layout, cache_key)
+                    return result
+
+        except Exception:
+            pass
 
     return [PageResult(_make_error_image(
         "DWG プレビュー不可",
@@ -557,14 +776,8 @@ def get_preview(
         layout_names = [target_layout] if target_layout is not None else None
         pages = preview_dxf(file_path, layout_names=layout_names)
     elif ext == ".dwg":
-        pages = preview_dwg(file_path, config)
-        # DWG: target_layout が指定された場合は一致するものだけ返す
-        if target_layout is not None and len(pages) > 1:
-            matched = [p for p in pages if getattr(p, 'layout_name', '') == target_layout]
-            if matched:
-                pages = matched[:1]
-            else:
-                pages = pages[:1]
+        # target_layout を直接 preview_dwg に渡す（不要なレイアウトのレンダリングをスキップ）
+        pages = preview_dwg(file_path, config, target_layout=target_layout)
     elif ext == ".slddrw":
         pages = preview_slddrw(file_path, config)
         if target_page is not None and len(pages) > 1:

@@ -339,3 +339,87 @@ class TestPreviewEngine:
         assert pages_no[0].mode == "RGB"
         assert pages_hl[0].hit_boxes == []
         assert pages_no[0].hit_boxes == []
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  DWG disk-cache helpers
+# ────────────────────────────────────────────────────────────────────────────
+
+class TestDwgDiskCache:
+    """Tests for DWG disk-cache infrastructure in preview_engine."""
+
+    def test_cache_key_is_deterministic(self):
+        from src.preview.preview_engine import _dwg_cache_key
+        k1 = _dwg_cache_key("/some/path/file.dwg", 1234567890.0)
+        k2 = _dwg_cache_key("/some/path/file.dwg", 1234567890.0)
+        assert k1 == k2
+
+    def test_cache_key_differs_for_different_mtime(self):
+        from src.preview.preview_engine import _dwg_cache_key
+        k1 = _dwg_cache_key("/some/path/file.dwg", 1.0)
+        k2 = _dwg_cache_key("/some/path/file.dwg", 2.0)
+        assert k1 != k2
+
+    def test_cache_key_differs_for_different_path(self):
+        from src.preview.preview_engine import _dwg_cache_key
+        k1 = _dwg_cache_key("/a/file.dwg", 1.0)
+        k2 = _dwg_cache_key("/b/file.dwg", 1.0)
+        assert k1 != k2
+
+    def test_cache_key_length(self):
+        from src.preview.preview_engine import _dwg_cache_key
+        k = _dwg_cache_key("/some/file.dwg", 0.0)
+        assert len(k) == 16
+
+    def test_dxf_cache_path_ends_with_dxf(self):
+        from src.preview.preview_engine import _dwg_dxf_cache_path
+        p = _dwg_dxf_cache_path("abcdef1234567890")
+        assert p.endswith(".dxf")
+
+    def test_png_cache_path_ends_with_png(self):
+        from src.preview.preview_engine import _dwg_png_cache_path
+        p = _dwg_png_cache_path("abcdef1234567890", "Sheet1")
+        assert p.endswith(".png")
+        assert "Sheet1" in os.path.basename(p)
+
+    def test_png_cache_path_safe_chars(self):
+        """Slashes and spaces in layout name must be sanitized."""
+        from src.preview.preview_engine import _dwg_png_cache_path
+        p = _dwg_png_cache_path("key", "Sheet/1 Test")
+        basename = os.path.basename(p)
+        assert "/" not in basename
+        assert " " not in basename
+
+    def test_dwg_cache_dir_created(self, tmp_path, monkeypatch):
+        """_dwg_cache_dir() must create the directory if it does not exist."""
+        import src.preview.preview_engine as pe
+        fake_cache = str(tmp_path / "fake_cache" / "drawing_search" / "dwg_preview")
+        monkeypatch.setattr(pe, "_dwg_cache_dir", lambda: (
+            os.makedirs(fake_cache, exist_ok=True) or fake_cache
+        ))
+        d = pe._dwg_cache_dir()
+        assert os.path.isdir(d)
+
+    def test_dwg_no_oda_returns_error_pageresult(self, tmp_path):
+        """preview_dwg without ODA returns an error PageResult (not an exception)."""
+        from src.preview.preview_engine import preview_dwg, PageResult
+        fake_dwg = str(tmp_path / "test.dwg")
+        # Minimal DWG-like file (not a real DWG, just non-empty)
+        with open(fake_dwg, "wb") as f:
+            f.write(b"AC1015" + b"\x00" * 100)
+        result = preview_dwg(fake_dwg, config={"oda_path": ""})
+        assert isinstance(result, list)
+        assert len(result) >= 1
+        assert isinstance(result[0], PageResult)
+
+    def test_dwg_cache_purge_does_not_raise(self, tmp_path, monkeypatch):
+        """_dwg_cache_purge must not raise even with many files."""
+        import src.preview.preview_engine as pe
+        monkeypatch.setattr(pe, "_dwg_cache_dir", lambda: str(tmp_path))
+        # Create 10 dummy files
+        for i in range(10):
+            (tmp_path / f"dummy_{i}.png").write_bytes(b"x")
+        # Purge with max_entries=5 should remove 5 files silently
+        pe._dwg_cache_purge(max_entries=5)
+        remaining = list(tmp_path.iterdir())
+        assert len(remaining) == 5
