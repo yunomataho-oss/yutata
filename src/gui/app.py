@@ -18,7 +18,13 @@ Menubar: File > Index Folder / Index File / Clear Index / Exit
 """
 from __future__ import annotations
 
+import csv
+import datetime
+import io
 import os
+import queue
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -114,9 +120,14 @@ class DrawingSearchApp(tk.Tk):
         file_menu.add_command(label="インデックスをクリア (Clear Index)",
                               command=self._clear_index)
         file_menu.add_separator()
+        file_menu.add_command(label="検索結果を CSV で保存… (Export Results to CSV)",
+                              command=self._export_csv,
+                              accelerator="Ctrl+Shift+E")
+        file_menu.add_separator()
         file_menu.add_command(label="終了 (Exit)", command=self._on_close, accelerator="Alt+F4")
         menubar.add_cascade(label="ファイル (File)", menu=file_menu)
         self.bind_all("<Control-o>", lambda _e: self._index_folder())
+        self.bind_all("<Control-E>", lambda _e: self._export_csv())
 
         # View menu
         view_menu = tk.Menu(menubar, tearoff=0)
@@ -184,6 +195,16 @@ class DrawingSearchApp(tk.Tk):
         )
         search_btn.pack(side=tk.LEFT, padx=(0, 10))
 
+        # CSV export button
+        csv_btn = tk.Button(
+            toolbar, text="📋 CSV出力", font=FONT_MAIN,
+            bg="#2e7d32", fg="white", relief=tk.FLAT,
+            padx=10, pady=4,
+            command=self._export_csv,
+            cursor="hand2",
+        )
+        csv_btn.pack(side=tk.RIGHT, padx=(0, 6))
+
         # Index folder button (quick access)
         index_btn = tk.Button(
             toolbar, text="📂 フォルダ登録 (Index Folder)", font=FONT_MAIN,
@@ -243,6 +264,8 @@ class DrawingSearchApp(tk.Tk):
         ctx.add_command(label="ファイルを開く (Open File)",      command=self._open_file)
         ctx.add_command(label="フォルダを開く (Open Folder)",    command=self._open_containing_folder)
         ctx.add_command(label="パスをコピー (Copy Path)",         command=self._copy_path)
+        ctx.add_separator()
+        ctx.add_command(label="📋 検索結果を CSV で保存…",        command=self._export_csv)
         self._tree.bind("<Button-3>", lambda e: ctx.post(e.x_root, e.y_root))
 
         # ---- 詳細テキスト ----
@@ -265,27 +288,20 @@ class DrawingSearchApp(tk.Tk):
         right_frame = tk.Frame(h_paned, bg="#2b2b2b")
         h_paned.add(right_frame, minsize=300)
 
-        # プレビューヘッダー
+        # プレビューヘッダー（上段）
         prev_header = tk.Frame(right_frame, bg="#37474f", pady=3)
         prev_header.pack(side=tk.TOP, fill=tk.X)
 
         tk.Label(prev_header, text="プレビュー (Preview)",
                  font=FONT_BOLD, bg="#37474f", fg="white").pack(side=tk.LEFT, padx=8)
 
-        # ページ送りボタン
-        self._inline_page_label = tk.Label(prev_header, text="— / —",
-                                            bg="#37474f", fg="white", font=FONT_BOLD)
+        # レイアウト名ラベル（該当ページ1枚表示なのでページ送りボタンは不要）
+        self._inline_page_label = tk.Label(prev_header, text="",
+                                            bg="#37474f", fg="#90caf9", font=FONT_BOLD)
         self._inline_page_label.pack(side=tk.LEFT, padx=8)
 
-        tk.Button(prev_header, text="◀", command=self._inline_prev_page,
-                  bg="#546e7a", fg="white", relief=tk.FLAT, padx=4,
-                  cursor="hand2").pack(side=tk.LEFT, padx=2)
-        tk.Button(prev_header, text="▶", command=self._inline_next_page,
-                  bg="#546e7a", fg="white", relief=tk.FLAT, padx=4,
-                  cursor="hand2").pack(side=tk.LEFT, padx=2)
-
-        # 別ウィンドウで開くボタン
-        tk.Button(prev_header, text="⬜ 別ウィンドウ", command=self._open_preview_window,
+        # 別ウィンドウで開くボタン（全ページ表示）
+        tk.Button(prev_header, text="⬜ 別ウィンドウ (全ページ)", command=self._open_preview_window,
                   bg="#1565c0", fg="white", relief=tk.FLAT, padx=6,
                   cursor="hand2").pack(side=tk.RIGHT, padx=8)
 
@@ -320,10 +336,21 @@ class DrawingSearchApp(tk.Tk):
         self._prev_hscroll.config(command=self._preview_canvas.xview)
 
         # プレビュー状態変数
-        self._inline_pages:   list = []
-        self._inline_tk_img   = None   # GC 防止
+        self._inline_pages:   list = []   # list[PageResult]
+        self._inline_tk_img   = None      # GC 防止
         self._inline_current  = 0
         self._inline_zoom     = 1.0
+        self._inline_src_img  = None      # オリジナル PIL Image (resize 元)
+        # プレビューデバウンス・キャンセル制御
+        self._preview_token: int = 0   # リクエストごとにインクリメント
+        self._preview_after_id = None  # after() ID (ロードデバウンス用)
+        self._zoom_after_id    = None  # after() ID (ズームデバウンス用)
+        # シングルワーカースレッド: Queue 経由で逐次処理
+        self._preview_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._preview_worker_thread = threading.Thread(
+            target=self._preview_worker_loop, daemon=True
+        )
+        self._preview_worker_thread.start()
 
         # キャンバスドラッグ
         self._preview_canvas.bind("<ButtonPress-1>",  self._prev_drag_start)
@@ -415,8 +442,8 @@ class DrawingSearchApp(tk.Tk):
             return
         result = self._results[idx]
         self._show_detail(result)
-        # インラインプレビューを非同期でロード
-        self._load_inline_preview(result.entry.file_path)
+        # インラインプレビューを非同期でロード（該当ページのみ表示）
+        self._load_inline_preview(result)
 
     def _show_detail(self, result: SearchResult):
         entry = result.entry
@@ -450,8 +477,21 @@ class DrawingSearchApp(tk.Tk):
     #  Inline Preview Methods                                              #
     # ------------------------------------------------------------------ #
 
+    # ------------------------------------------------------------------ #
+    #  プレビュー: エクスプローラー風・低負荷設計                              #
+    # ------------------------------------------------------------------ #
+    # 設計方針:
+    #   1. シングルワーカースレッド + maxsize=1 Queue
+    #      → 連打しても最新リクエスト1件だけ処理。複数スレッドの生成なし
+    #   2. ezdxf.readfile を worker 内でのみ呼ぶ (UI スレッドでは一切ファイル I/O 不可)
+    #      _resolve_target は texts_blob テキストのみで判定 → 追加ファイル読み込み不要
+    #   3. resize も worker 内で完了させ、UI スレッドには PhotoImage を渡すだけ
+    #   4. ズームは 100ms デバウンス → ホイール連打で resize が連発しない
+    #   5. 高解像度元画像を _inline_src_img に保持 → ズームのたびに再レンダリング不要
+    # ------------------------------------------------------------------
+
     def _show_preview_placeholder(self, message: str):
-        """プレビューキャンバスにメッセージを表示する。"""
+        """プレビューキャンバスにメッセージを表示する（UIスレッドのみ）。"""
         self._preview_canvas.delete("all")
         w = max(self._preview_canvas.winfo_width(),  300)
         h = max(self._preview_canvas.winfo_height(), 200)
@@ -461,106 +501,274 @@ class DrawingSearchApp(tk.Tk):
             font=("Helvetica", 13), justify=tk.CENTER,
         )
 
-    def _load_inline_preview(self, file_path: str):
-        """バックグラウンドスレッドでプレビュー画像を生成する。"""
-        self._show_preview_placeholder("🔄 レンダリング中...")
-        self._inline_pages   = []
-        self._inline_current = 0
-        self._inline_zoom    = 1.0
+    # ── ロード要求（UIスレッド） ─────────────────────────────────────────
 
-        def worker():
-            from src.preview.preview_engine import get_preview
+    def _load_inline_preview(self, result):
+        """
+        デバウンス付きプレビューロード要求。
+        250ms 以内の連続選択は最後の 1 件だけ処理する。
+        """
+        if self._preview_after_id is not None:
+            self.after_cancel(self._preview_after_id)
+        self._preview_after_id = self.after(
+            250, lambda: self._enqueue_preview(result)
+        )
+
+    def _enqueue_preview(self, result):
+        """
+        ワーカーキューにリクエストを投入する。
+        maxsize=1 の Queue なので古いリクエストを捨てて最新だけ保持する。
+        """
+        self._preview_after_id = None
+        self._preview_token += 1
+        token = self._preview_token
+
+        self._inline_src_img  = None
+        self._inline_pages    = []
+        self._inline_current  = 0
+        self._inline_zoom     = 1.0
+        self._show_preview_placeholder("🔄 読み込み中...")
+
+        # キューが溢れていたら古いリクエストを捨てる
+        try:
+            self._preview_queue.get_nowait()
+        except queue.Empty:
+            pass
+        self._preview_queue.put((token, result))
+
+    # ── シングルワーカースレッド ─────────────────────────────────────────
+
+    def _preview_worker_loop(self):
+        """
+        シングルデーモンスレッドとして常駐するワーカーループ。
+        Queue からリクエストを1件ずつ取り出して処理する。
+        ・ファイル I/O (ezdxf.readfile / fitz) はここだけで行う
+        ・resize もここで完結させ、UIスレッドには PhotoImage のみ渡す
+        """
+        while True:
             try:
-                pages = get_preview(file_path, self._config, max_pages=30)
-            except Exception as exc:
-                from src.preview.preview_engine import _make_error_image
-                pages = [_make_error_image("プレビューエラー", str(exc))]
-            self.after(0, lambda: self._on_inline_loaded(pages, file_path))
+                token, result = self._preview_queue.get()  # ブロッキング
+            except Exception:
+                continue
 
-        threading.Thread(target=worker, daemon=True).start()
+            try:
+                tk_img, src_img, layout_name = self._render_for_display(
+                    token, result
+                )
+            except Exception:
+                tk_img = src_img = layout_name = None
 
-    def _on_inline_loaded(self, pages, file_path: str):
-        self._inline_pages   = pages
-        self._inline_current = 0
-        self._inline_zoom    = 1.0
-        self._draw_inline_page()
+            # トークンが既に更新されていたら結果を捨てる
+            if token != self._preview_token:
+                continue
 
-    def _draw_inline_page(self):
-        """現在のページをインラインキャンバスに描画する。"""
-        if not self._inline_pages:
-            return
+            # UI スレッドに描画を委託
+            self.after(0, lambda ti=tk_img, si=src_img, ln=layout_name, t=token:
+                       self._apply_preview_result(ti, si, ln, t))
 
-        idx = self._inline_current
-        img = self._inline_pages[idx]
+    def _render_for_display(
+        self, token: int, result
+    ):
+        """
+        ワーカースレッド内でファイルを読み込み、表示用 PhotoImage まで生成する。
+        戻り値: (ImageTk.PhotoImage, PIL.Image, layout_name: str)
+        """
+        from src.preview.preview_engine import get_preview, _make_error_image, PageResult
+        from PIL import Image as _Image, ImageTk
 
-        # ウィンドウ幅に合わせて自動フィット（初回のみ zoom=1 → fit に調整）
+        file_path = result.entry.file_path
+
+        # ── target_layout / target_page を texts_blob だけで決定 ─────────
+        # ★ ezdxf.readfile を追加で呼ばない。texts_blob のテキストで判定する。
+        target_layout, target_page = self._resolve_target_from_blob(result)
+
+        # トークンが変わったら即中断
+        if token != self._preview_token:
+            return None, None, ""
+
+        try:
+            pages = get_preview(
+                file_path, self._config,
+                max_pages=1,
+                target_layout=target_layout,
+                target_page=target_page,
+            )
+        except Exception as exc:
+            pages = [PageResult(_make_error_image("プレビューエラー", str(exc)))]
+
+        if token != self._preview_token:
+            return None, None, ""
+
+        pr  = pages[0] if pages else PageResult(_make_error_image("空", ""))
+        img = pr.image if hasattr(pr, 'image') else pr
+        layout_name = img.info.get("layout_name") or getattr(pr, 'layout_name', '') or ""
+
+        # ── キャンバスサイズに合わせてリサイズ（ワーカー内で完結）────────
         cw = max(self._preview_canvas.winfo_width(),  300)
         ch = max(self._preview_canvas.winfo_height(), 200)
-        if self._inline_zoom == 1.0:
-            zw = cw / img.width
-            zh = ch / img.height
-            self._inline_zoom = min(zw, zh) * 0.97
+        zw = cw / max(img.width,  1)
+        zh = ch / max(img.height, 1)
+        zoom = min(zw, zh) * 0.97
+        zoom = max(0.05, min(zoom, 4.0))
 
-        new_w = max(1, int(img.width  * self._inline_zoom))
-        new_h = max(1, int(img.height * self._inline_zoom))
-        from PIL import Image as _Image, ImageTk
-        resized = img.resize((new_w, new_h), _Image.LANCZOS)
-        self._inline_tk_img = ImageTk.PhotoImage(resized)   # GC 防止
+        new_w = max(1, int(img.width  * zoom))
+        new_h = max(1, int(img.height * zoom))
+        filt  = _Image.BILINEAR if zoom >= 1.0 else _Image.NEAREST
+        resized   = img.resize((new_w, new_h), filt)
+        tk_img    = ImageTk.PhotoImage(resized)
 
+        # zoom 値を img.info に記録して UI スレッドに伝える
+        img.info["_zoom"] = zoom
+
+        return tk_img, img, layout_name
+
+    # ── texts_blob のみからレイアウトを推定（ファイル再読み込みなし）────
+
+    @staticmethod
+    def _resolve_target_from_blob(result) -> tuple:
+        """
+        IndexEntry.texts_blob のみを使って target_layout / target_page を決定する。
+        ezdxf.readfile などの I/O は一切行わない。
+
+        DXF/DWG の texts_blob は "[レイアウト名]\nテキスト1\nテキスト2\n..." 形式で
+        各レイアウトのテキストが記録されている。
+        その形式を利用してマッチしたテキストが属するレイアウト名を推定する。
+        """
+        import re as _re
+        entry      = result.entry
+        ext        = os.path.splitext(entry.file_path)[1].lower()
+        match_type = result.match_type
+        matched    = result.matched_value
+
+        target_layout: Optional[str] = None
+        target_page:   Optional[int] = None
+
+        if ext in (".dxf", ".dwg"):
+            if match_type == "full_text" and matched.strip():
+                # texts_blob から "[レイアウト名]" セクションヘッダーを探す
+                blob = entry.texts_blob or ""
+                # セクション区切りパターン: 先頭に "[名前]" がある行
+                sections = _re.split(r'(?m)^\[([^\]]+)\]\s*$', blob)
+                # sections = [前文, 名前1, 本文1, 名前2, 本文2, ...]
+                pattern = _re.compile(_re.escape(matched.strip()), _re.IGNORECASE)
+                if len(sections) >= 3:
+                    # セクション形式のときだけレイアウト特定を試みる
+                    for i in range(1, len(sections) - 1, 2):
+                        name, body = sections[i], sections[i + 1]
+                        if pattern.search(body):
+                            target_layout = name
+                            break
+                # セクション形式でなければ None のまま（全レイアウト）
+
+        elif ext == ".pdf":
+            target_page = 0
+
+        return target_layout, target_page
+
+    # ── 描画適用（UIスレッド） ─────────────────────────────────────────
+
+    def _apply_preview_result(
+        self,
+        tk_img,         # ImageTk.PhotoImage | None
+        src_img,        # PIL.Image          | None
+        layout_name: str,
+        token: int,
+    ):
+        """ワーカーから渡された完成済み PhotoImage をキャンバスに貼るだけ。"""
+        if token != self._preview_token:
+            return
+        if tk_img is None:
+            self._show_preview_placeholder("プレビューを表示できませんでした")
+            return
+
+        zoom = src_img.info.get("_zoom", 1.0) if src_img else 1.0
+        self._inline_zoom    = zoom
+        self._inline_src_img = src_img
+        self._inline_tk_img  = tk_img   # GC 防止
+
+        w = tk_img.width()
+        h = tk_img.height()
         self._preview_canvas.delete("all")
-        self._preview_canvas.create_image(0, 0, anchor=tk.NW,
-                                           image=self._inline_tk_img)
-        self._preview_canvas.configure(scrollregion=(0, 0, new_w, new_h))
+        self._preview_canvas.create_image(0, 0, anchor=tk.NW, image=tk_img)
+        self._preview_canvas.configure(scrollregion=(0, 0, w, h))
         self._preview_canvas.xview_moveto(0)
         self._preview_canvas.yview_moveto(0)
 
-        total = len(self._inline_pages)
-        layout = img.info.get("layout_name", f"ページ {idx + 1}")
-        self._inline_page_label.config(text=f"{idx + 1} / {total}")
-        self._inline_zoom_label.config(text=f"{int(self._inline_zoom * 100)}%")
+        self._inline_page_label.config(text=layout_name)
+        self._inline_zoom_label.config(text=f"{int(zoom * 100)}%")
         self._status_var.set(
-            f"{layout}  |  ズーム: {int(self._inline_zoom * 100)}%  |  "
-            "Ctrl+ホイールでズーム / ドラッグでスクロール / ダブルクリックで別ウィンドウ"
+            f"{layout_name}  |  ズーム: {int(zoom * 100)}%  |  "
+            "Ctrl+ホイールでズーム / ドラッグでスクロール / ダブルクリックで別ウィンドウ(全ページ)"
         )
 
-    def _inline_prev_page(self):
-        if self._inline_current > 0:
-            self._inline_current -= 1
-            self._inline_zoom = 1.0
-            self._draw_inline_page()
-
-    def _inline_next_page(self):
-        if self._inline_pages and self._inline_current < len(self._inline_pages) - 1:
-            self._inline_current += 1
-            self._inline_zoom = 1.0
-            self._draw_inline_page()
+    # ── ズーム（UIスレッド、デバウンス付き）─────────────────────────────
 
     def _inline_zoom_in(self):
         self._inline_zoom = min(4.0, self._inline_zoom + 0.15)
-        self._redraw_inline()
+        self._schedule_zoom_redraw()
 
     def _inline_zoom_out(self):
-        self._inline_zoom = max(0.1, self._inline_zoom - 0.15)
-        self._redraw_inline()
+        self._inline_zoom = max(0.05, self._inline_zoom - 0.15)
+        self._schedule_zoom_redraw()
 
     def _inline_fit(self):
-        self._inline_zoom = 1.0   # trigger auto-fit in draw
-        self._draw_inline_page()
-
-    def _redraw_inline(self):
-        if not self._inline_pages:
+        """キャンバスにフィットするズーム率を再計算して再描画。"""
+        if self._inline_src_img is None:
             return
-        idx = self._inline_current
-        img = self._inline_pages[idx]
-        new_w = max(1, int(img.width  * self._inline_zoom))
-        new_h = max(1, int(img.height * self._inline_zoom))
-        from PIL import Image as _Image, ImageTk
-        resized = img.resize((new_w, new_h), _Image.LANCZOS)
-        self._inline_tk_img = ImageTk.PhotoImage(resized)
+        img = self._inline_src_img
+        cw  = max(self._preview_canvas.winfo_width(),  300)
+        ch  = max(self._preview_canvas.winfo_height(), 200)
+        zw  = cw / max(img.width,  1)
+        zh  = ch / max(img.height, 1)
+        self._inline_zoom = min(zw, zh) * 0.97
+        self._schedule_zoom_redraw()
+
+    def _schedule_zoom_redraw(self):
+        """
+        ズーム操作を 100ms デバウンスして _do_zoom_redraw を呼ぶ。
+        ホイール連打による連続 resize を防ぐ。
+        """
+        if self._zoom_after_id is not None:
+            self.after_cancel(self._zoom_after_id)
+        self._zoom_after_id = self.after(100, self._do_zoom_redraw)
+
+    def _do_zoom_redraw(self):
+        """
+        ズーム後の resize をバックグラウンドで実行する。
+        _inline_src_img（高解像度元画像）から resize するので
+        get_preview の再呼び出しは不要。
+        """
+        self._zoom_after_id = None
+        if self._inline_src_img is None:
+            return
+
+        zoom    = self._inline_zoom
+        src_img = self._inline_src_img
+        token   = self._preview_token
+
+        def _worker():
+            from PIL import Image as _Image, ImageTk
+            new_w = max(1, int(src_img.width  * zoom))
+            new_h = max(1, int(src_img.height * zoom))
+            filt  = _Image.BILINEAR if zoom >= 1.0 else _Image.NEAREST
+            resized = src_img.resize((new_w, new_h), filt)
+            tk_img  = ImageTk.PhotoImage(resized)
+            if token == self._preview_token:
+                self.after(0, lambda: self._apply_zoom_result(tk_img, zoom, new_w, new_h, token))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_zoom_result(self, tk_img, zoom, w, h, token):
+        """ズーム後の PhotoImage をキャンバスに反映（UIスレッド）。"""
+        if token != self._preview_token:
+            return
+        self._inline_tk_img = tk_img   # GC 防止
         self._preview_canvas.delete("all")
-        self._preview_canvas.create_image(0, 0, anchor=tk.NW, image=self._inline_tk_img)
-        self._preview_canvas.configure(scrollregion=(0, 0, new_w, new_h))
-        self._inline_zoom_label.config(text=f"{int(self._inline_zoom * 100)}%")
+        self._preview_canvas.create_image(0, 0, anchor=tk.NW, image=tk_img)
+        self._preview_canvas.configure(scrollregion=(0, 0, w, h))
+        self._inline_zoom_label.config(text=f"{int(zoom * 100)}%")
+
+    # ── スクロール / ドラッグ ────────────────────────────────────────────
 
     def _prev_drag_start(self, event):
         self._preview_canvas.scan_mark(event.x, event.y)
@@ -772,6 +980,158 @@ class DrawingSearchApp(tk.Tk):
             self._status_var.set("インデックスをクリアしました。")
 
     # ------------------------------------------------------------------ #
+    #  CSV Export                                                          #
+    # ------------------------------------------------------------------ #
+
+    def _export_csv(self, *_):
+        """検索結果をCSVファイルに保存するダイアログを開く。"""
+        # 出力対象を選択
+        if self._results:
+            choice = self._ask_csv_target()
+            if choice is None:
+                return   # キャンセル
+        else:
+            # 検索結果がない場合はインデックス全件を対象にする
+            choice = "index"
+
+        # 保存先ダイアログ
+        ts    = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"search_results_{ts}.csv" if choice == "results" else f"index_all_{ts}.csv"
+        save_path = filedialog.asksaveasfilename(
+            title="CSV を保存 (Save CSV)",
+            initialfile=default_name,
+            defaultextension=".csv",
+            filetypes=[("CSV ファイル", "*.csv"), ("すべてのファイル", "*")],
+        )
+        if not save_path:
+            return
+
+        try:
+            if choice == "results":
+                self._write_results_csv(save_path, self._results)
+                count = len(self._results)
+            else:
+                self._write_index_csv(save_path, list(self.engine.indexed_files))
+                count = self.engine.index_size
+
+            self._status_var.set(f"CSV 保存完了: {count} 件 → {save_path}")
+
+            # 保存後に開くか確認
+            if messagebox.askyesno(
+                "CSV 保存完了",
+                f"{count} 件を保存しました。\n\n{save_path}\n\nファイルを開きますか？",
+            ):
+                self._os_open(save_path)
+
+        except Exception as exc:
+            messagebox.showerror("CSV 保存エラー", str(exc))
+
+    def _ask_csv_target(self) -> Optional[str]:
+        """検索結果 / インデックス全件 のどちらを出力するか選択させる。"""
+        win = tk.Toplevel(self)
+        win.title("CSV 出力対象")
+        win.resizable(False, False)
+        win.grab_set()
+
+        # ウィンドウを親の中央に配置
+        self.update_idletasks()
+        px, py = self.winfo_rootx(), self.winfo_rooty()
+        pw, ph = self.winfo_width(), self.winfo_height()
+        win.geometry(f"340x160+{px + pw//2 - 170}+{py + ph//2 - 80}")
+
+        choice = tk.StringVar(value="results")
+
+        tk.Label(win, text="出力する内容を選択してください",
+                 font=FONT_BOLD, pady=8).pack()
+        tk.Radiobutton(
+            win, text=f"現在の検索結果 ({len(self._results)} 件)",
+            variable=choice, value="results", font=FONT_MAIN,
+        ).pack(anchor=tk.W, padx=24)
+        tk.Radiobutton(
+            win, text=f"インデックス全件 ({self.engine.index_size} 件)",
+            variable=choice, value="index", font=FONT_MAIN,
+        ).pack(anchor=tk.W, padx=24)
+
+        result: List[Optional[str]] = [None]
+
+        def ok():
+            result[0] = choice.get()
+            win.destroy()
+
+        def cancel():
+            win.destroy()
+
+        btn_frame = tk.Frame(win)
+        btn_frame.pack(pady=10)
+        tk.Button(btn_frame, text="OK",       width=10, command=ok,     bg="#1565c0", fg="white").pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_frame, text="キャンセル", width=10, command=cancel, bg="#546e7a", fg="white").pack(side=tk.LEFT, padx=6)
+
+        win.bind("<Return>", lambda _: ok())
+        win.bind("<Escape>", lambda _: cancel())
+        win.wait_window()
+        return result[0]
+
+    @staticmethod
+    def _write_results_csv(path: str, results: List[SearchResult]):
+        """検索結果リストを CSV に書き出す。"""
+        # BOM 付き UTF-8 で保存 (Excel でも文字化けしない)
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "ファイル名",
+                "図面番号",
+                "マッチ種別",
+                "マッチ値",
+                "スコア",
+                "ファイル種別",
+                "タイトル",
+                "エラー",
+                "ファイルパス",
+                "フォルダ",
+            ])
+            for r in results:
+                e = r.entry
+                writer.writerow([
+                    e.filename,
+                    "; ".join(e.drawing_numbers) if e.drawing_numbers else "",
+                    r.match_type,
+                    r.matched_value,
+                    f"{r.score:.3f}",
+                    e.file_type.upper(),
+                    e.title or "",
+                    e.error or "",
+                    e.file_path,
+                    os.path.dirname(e.file_path),
+                ])
+
+    @staticmethod
+    def _write_index_csv(path: str, entries: list):
+        """インデックス全件を CSV に書き出す。"""
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "ファイル名",
+                "ファイル種別",
+                "図面番号",
+                "タイトル",
+                "抽出テキスト冒頭500字",
+                "エラー",
+                "ファイルパス",
+                "フォルダ",
+            ])
+            for e in entries:
+                writer.writerow([
+                    e.filename,
+                    e.file_type.upper(),
+                    "; ".join(e.drawing_numbers) if e.drawing_numbers else "",
+                    e.title or "",
+                    e.texts_blob[:500].replace("\n", " "),
+                    e.error or "",
+                    e.file_path,
+                    os.path.dirname(e.file_path),
+                ])
+
+    # ------------------------------------------------------------------ #
     #  Utility actions                                                     #
     # ------------------------------------------------------------------ #
 
@@ -809,7 +1169,6 @@ class DrawingSearchApp(tk.Tk):
 
     @staticmethod
     def _os_open(path: str):
-        import subprocess
         if sys.platform == "win32":
             os.startfile(path)
         elif sys.platform == "darwin":
@@ -995,7 +1354,7 @@ class DrawingSearchApp(tk.Tk):
         ttk.Button(btn_frame, text="キャンセル",    command=win.destroy).pack(side=tk.LEFT)
 
     def _check_oda(self):
-        """ODA の検出状態を詳しく表示する診断ダイアログ。"""
+        """ODA の検出状態を詳しく表示する診断ダイアログ（実行テスト付き）。"""
         custom_path = self._config.get("oda_path", "")
         oda_exe     = find_oda_executable(custom_path)
 
@@ -1004,7 +1363,6 @@ class DrawingSearchApp(tk.Tk):
         if oda_exe:
             lines.append(f"✅ 検出: {oda_exe}\n")
             # バージョン確認
-            import subprocess
             try:
                 result = subprocess.run(
                     [oda_exe, "--version"],
@@ -1015,11 +1373,99 @@ class DrawingSearchApp(tk.Tk):
                     lines.append(f"バージョン情報: {ver_out[:200]}")
             except Exception as e:
                 lines.append(f"バージョン取得不可 ({e})")
+
+            # ── ezdxf.options への登録確認 ─────────────────────────────
+            lines.append("")
+            lines.append("─── ezdxf 設定状態 ───")
+            try:
+                import ezdxf
+                from src.extractors.dwg_extractor import set_odafc_path
+                set_odafc_path(oda_exe)   # 診断時にも確実に登録
+                if sys.platform == "win32":
+                    registered = ezdxf.options.get("odafc-addon", "win_exec_path").strip('"')
+                else:
+                    registered = ezdxf.options.get("odafc-addon", "unix_exec_path").strip('"')
+                match = "✅" if registered == oda_exe else "⚠️"
+                lines.append(f"  {match} ezdxf options 登録値: {registered or '(空)'}")
+                lines.append(f"  期待値: {oda_exe}")
+            except Exception as ex:
+                lines.append(f"  ⚠️ ezdxf 設定確認エラー: {ex}")
+
+            # ── DISPLAY 環境変数の確認 (Linux/macOS) ─────────────────
+            if sys.platform != "win32":
+                lines.append("")
+                lines.append("─── 表示環境 (Linux/macOS) ───")
+                disp = os.environ.get("DISPLAY", "")
+                xvfb = shutil.which("Xvfb")
+                xvfb_run = shutil.which("xvfb-run")
+                lines.append(f"  DISPLAY 環境変数 : {disp or '(未設定)'}")
+                lines.append(f"  Xvfb            : {'✅ ' + xvfb if xvfb else '❌ 未インストール'}")
+                lines.append(f"  xvfb-run        : {'✅ ' + xvfb_run if xvfb_run else '❌ 未インストール'}")
+                if not disp and not xvfb:
+                    lines.append("  ⚠️ DISPLAY が未設定で Xvfb もない場合、")
+                    lines.append("     ODA が GUI を開こうとしてクラッシュする可能性があります。")
+                    lines.append("     対処法: sudo apt install xvfb  または")
+                    lines.append("             export DISPLAY=:0  (X Server が起動している場合)")
+
+            # ── 実際の変換テスト ──────────────────────────────────────
+            lines.append("")
+            lines.append("─── 変換テスト (最小 DWG ファイル) ───")
+            try:
+                import tempfile as _tmp
+                from src.extractors.dwg_extractor import _ensure_display_env
+                env = _ensure_display_env()
+
+                # 最小限の DWG ヘッダーを持つダミーファイルで動作確認
+                # (実際の変換は行えないが ODA が起動するか確認できる)
+                with _tmp.TemporaryDirectory() as _td:
+                    _fin  = os.path.join(_td, "test_in")
+                    _fout = os.path.join(_td, "test_out")
+                    os.makedirs(_fin); os.makedirs(_fout)
+
+                    cmd_test = [oda_exe, _fin, _fout, "ACAD2018", "DXF", "0", "0"]
+                    if sys.platform != "win32" and shutil.which("xvfb-run"):
+                        cmd_test = ["xvfb-run", "-a"] + cmd_test
+
+                    run_kwargs: dict = dict(capture_output=True, timeout=30, env=env)
+                    if sys.platform == "win32":
+                        run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+                    try:
+                        proc = subprocess.run(cmd_test, **run_kwargs)
+                        rc = proc.returncode
+
+                        def _dec(b):
+                            if not b: return ""
+                            for enc in ("utf-8", "cp932", "cp1252", "latin-1"):
+                                try: return b.decode(enc)
+                                except Exception: pass
+                            return b.decode("utf-8", errors="replace")
+
+                        out = (_dec(proc.stdout) + _dec(proc.stderr)).strip()
+                        if rc == 0 or "converted" in out.lower() or out == "":
+                            lines.append(f"  ✅ ODA 起動成功 (returncode={rc})")
+                        else:
+                            lines.append(f"  ⚠️ ODA 起動 returncode={rc}")
+                        if out:
+                            lines.append(f"  出力: {out[:300]}")
+                        if rc != 0 and sys.platform == "win32":
+                            lines.append("  ℹ️ Windows では ODA が空フォルダを変換しようとして")
+                            lines.append("     エラーを返すことがあります (正常動作の場合もあります)")
+                    except subprocess.TimeoutExpired:
+                        lines.append("  ❌ ODA がタイムアウト (30秒) — GUI が固まっている可能性")
+                        if sys.platform != "win32":
+                            lines.append("     xvfb (仮想ディスプレイ) のインストールを推奨")
+                        else:
+                            lines.append("     管理者権限で実行を試してください")
+                    except Exception as ex2:
+                        lines.append(f"  ❌ ODA 実行エラー: {ex2}")
+            except Exception as ex:
+                lines.append(f"  テスト実行不可: {ex}")
+
         else:
             lines.append("❌ ODA File Converter が見つかりません\n")
             lines.append("確認した候補パス:")
-            import shutil as _sh, sys as _sys
-            if _sys.platform == "win32":
+            if sys.platform == "win32":
                 candidates = [
                     r"C:\Program Files\ODA\ODAFileConverter\ODAFileConverter.exe",
                     r"C:\Program Files (x86)\ODA\ODAFileConverter\ODAFileConverter.exe",
@@ -1027,7 +1473,7 @@ class DrawingSearchApp(tk.Tk):
                 for c in candidates:
                     mark = "✅" if os.path.isfile(c) else "❌"
                     lines.append(f"  {mark} {c}")
-            found_cmd = _sh.which("ODAFileConverter")
+            found_cmd = shutil.which("ODAFileConverter")
             lines.append(f"  {'✅' if found_cmd else '❌'} PATH上: ODAFileConverter "
                          f"({'→ ' + found_cmd if found_cmd else '未発見'})")
 
@@ -1045,7 +1491,7 @@ class DrawingSearchApp(tk.Tk):
 
         win = tk.Toplevel(self)
         win.title("ODA 診断")
-        win.geometry("680x420")
+        win.geometry("720x520")
         txt = scrolledtext.ScrolledText(win, font=FONT_MONO, wrap=tk.WORD,
                                          bg="#1e1e1e", fg="#d4d4d4")
         txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)

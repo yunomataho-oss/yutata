@@ -20,6 +20,9 @@ class ExtractionResult:
     revision: Optional[str] = None
     raw_metadata: dict = field(default_factory=dict)
     error: Optional[str] = None
+    # DXF/DWG のみ: "[レイアウト名]\nテキスト\n..." 形式のセクション付き blob
+    # _resolve_target_from_blob でレイアウト判定に使用される
+    texts_blob_sections: Optional[str] = None
 
     @property
     def filename(self) -> str:

@@ -99,14 +99,26 @@ class DxfExtractor(BaseExtractor):
         try:
             doc = ezdxf.readfile(file_path)
             texts: List[str] = []
+            # レイアウト別セクション: "[レイアウト名]\nテキスト..." 形式
+            # → search_engine の texts_blob にそのまま格納され、
+            #   _resolve_target_from_blob でレイアウト特定に利用する。
+            layout_sections: List[str] = []
 
             # Modelspace
-            texts.extend(_collect_texts_from_layout(doc.modelspace()))
+            model_texts = _collect_texts_from_layout(doc.modelspace())
+            if model_texts:
+                layout_sections.append("[Model]")
+                layout_sections.extend(model_texts)
+            texts.extend(model_texts)
 
             # All paper space layouts
             for layout in doc.layouts:
                 if layout.name != "Model":
-                    texts.extend(_collect_texts_from_layout(layout))
+                    lt = _collect_texts_from_layout(layout)
+                    if lt:
+                        layout_sections.append(f"[{layout.name}]")
+                        layout_sections.extend(lt)
+                    texts.extend(lt)
 
             # All block definitions (title block, standard parts)
             for block in doc.blocks:
@@ -119,6 +131,8 @@ class DxfExtractor(BaseExtractor):
 
             result.texts = list(dict.fromkeys(t for t in texts if t.strip()))
             result.drawing_numbers = _extract_drawing_numbers(result.texts)
+            # texts_blob にレイアウト別セクション情報を含める
+            result.texts_blob_sections = "\n".join(layout_sections)
 
             # Try to detect title from filename
             result.raw_metadata = {

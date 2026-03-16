@@ -9,13 +9,14 @@ preview_panel.py — プレビューウィンドウ (Tkinter)
   ・「ページ/前・次」ボタン
   ・ウィンドウ幅に合わせてフィット表示
   ・背景スレッドで非同期レンダリング（UIブロックなし）
+  ・ハイライトナビゲーション (◀前 / 次▶ で全ページ通しで移動)
 """
 from __future__ import annotations
 
 import os
 import sys
 import threading
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import tkinter as tk
 from tkinter import ttk
@@ -23,7 +24,7 @@ from tkinter import ttk
 from PIL import Image, ImageTk
 
 # ── 定数 ─────────────────────────────────────────────────────────────────
-THUMB_W, THUMB_H = 140, 100
+THUMB_W, THUMB_H = 120, 85          # サムネイルサイズ縮小 (旧 140×100)
 MIN_ZOOM, MAX_ZOOM = 0.25, 4.0
 ZOOM_STEP          = 0.15
 BG_CANVAS          = "#2b2b2b"
@@ -51,12 +52,17 @@ class PreviewWindow(tk.Toplevel):
         self.config         = config or {}
         self.highlight_text = highlight_text
 
-        self._pages:   List[Image.Image] = []
+        self._pages:   list = []   # list[PageResult]
         self._tk_imgs: List[Optional[ImageTk.PhotoImage]] = []
         self._current  = 0
         self._zoom     = 1.0
         self._drag_start: Optional[tuple] = None
         self._loading  = False
+        self._thumb_tk_imgs: list = []   # サムネイル GC 防止
+
+        # ハイライトナビゲーション
+        self._hl_hit_list: list = []   # [(page_idx, x1,y1,x2,y2), ...]
+        self._hl_hit_idx:  int  = -1
 
         fname = os.path.basename(file_path)
         self.title(f"プレビュー — {fname}")
@@ -75,6 +81,8 @@ class PreviewWindow(tk.Toplevel):
         self.bind("<Left>",       lambda _: self._prev_page())
         self.bind("<Right>",      lambda _: self._next_page())
         self.bind("<Escape>",     lambda _: self.destroy())
+        self.bind("<n>",          lambda _: self._hl_next())
+        self.bind("<p>",          lambda _: self._hl_prev())
 
     # ──────────────────────────────────────────────────────────────────
     #  UI 構築
@@ -119,6 +127,33 @@ class PreviewWindow(tk.Toplevel):
         fname = os.path.basename(self.file_path)
         tk.Label(tb, text=fname, bg="#37474f", fg="#90caf9",
                  font=("Helvetica", 9)).pack(side=tk.RIGHT, padx=12)
+
+        # ── ハイライトナビゲーションバー ────────────────────────────
+        hl_bar = tk.Frame(self, bg="#455a64", pady=3)
+        hl_bar.pack(side=tk.TOP, fill=tk.X)
+
+        self._hl_info_var = tk.StringVar(value="")
+        self._hl_info_lbl = tk.Label(
+            hl_bar, textvariable=self._hl_info_var,
+            bg="#455a64", fg="#ffd600", font=("Helvetica", 9),
+        )
+        self._hl_info_lbl.pack(side=tk.LEFT, padx=8)
+
+        tk.Button(
+            hl_bar, text="◀ 前の一致", command=self._hl_prev,
+            bg="#f9a825", fg="#333", relief=tk.FLAT, padx=5,
+            cursor="hand2", font=("Helvetica", 9),
+        ).pack(side=tk.LEFT, padx=2)
+        tk.Button(
+            hl_bar, text="次の一致 ▶", command=self._hl_next,
+            bg="#f9a825", fg="#333", relief=tk.FLAT, padx=5,
+            cursor="hand2", font=("Helvetica", 9),
+        ).pack(side=tk.LEFT, padx=2)
+
+        tk.Label(
+            hl_bar, text="(n=次  p=前)", bg="#455a64", fg="#90a4ae",
+            font=("Helvetica", 8),
+        ).pack(side=tk.LEFT, padx=4)
 
         # ── メインエリア (サイドバー + キャンバス) ──────────────────
         main_frame = tk.Frame(self, bg=BG_CANVAS)
@@ -202,10 +237,11 @@ class PreviewWindow(tk.Toplevel):
     def _load_thread(self):
         try:
             from src.preview.preview_engine import get_preview
-            pages = get_preview(self.file_path, self.config)
+            pages = get_preview(self.file_path, self.config,
+                                highlight_text=self.highlight_text)
         except Exception as exc:
-            from src.preview.preview_engine import _make_error_image
-            pages = [_make_error_image("プレビュー生成エラー", str(exc))]
+            from src.preview.preview_engine import _make_error_image, PageResult
+            pages = [PageResult(_make_error_image("プレビュー生成エラー", str(exc)))]
 
         self._pages   = pages
         self._tk_imgs = [None] * len(pages)
@@ -216,47 +252,134 @@ class PreviewWindow(tk.Toplevel):
         if not self._pages:
             return
         self._current = 0
+
+        # ハイライトボックスを全ページ横断でフラット化
+        hit_list = []
+        for pg_idx, pr in enumerate(self._pages):
+            boxes = getattr(pr, 'hit_boxes', [])
+            for box in boxes:
+                hit_list.append((pg_idx, box[0], box[1], box[2], box[3]))
+        self._hl_hit_list = hit_list
+        self._hl_hit_idx  = 0 if hit_list else -1
+        self._update_hl_info()
+
         self._build_thumbnails()
         self._fit_window()
         self._update_page_label()
+
+        # 最初のヒットがあれば自動スクロール
+        if hit_list:
+            first_pg = hit_list[0][0]
+            if first_pg != self._current:
+                self._current = first_pg
+            self.after(150, lambda: self._scroll_to_hit(0))
+
+    # ──────────────────────────────────────────────────────────────────
+    #  ハイライトナビゲーション
+    # ──────────────────────────────────────────────────────────────────
+
+    def _update_hl_info(self):
+        total = len(self._hl_hit_list)
+        hl    = self.highlight_text.strip()
+        if not hl or total == 0:
+            self._hl_info_var.set("" if not hl else f"ヒットなし: '{hl}'")
+        else:
+            cur = self._hl_hit_idx + 1 if self._hl_hit_idx >= 0 else 0
+            self._hl_info_var.set(f"ヒット {cur} / {total}  \"{hl}\"")
+
+    def _hl_next(self):
+        if not self._hl_hit_list:
+            return
+        self._hl_hit_idx = (self._hl_hit_idx + 1) % len(self._hl_hit_list)
+        self._scroll_to_hit(self._hl_hit_idx)
+        self._update_hl_info()
+
+    def _hl_prev(self):
+        if not self._hl_hit_list:
+            return
+        self._hl_hit_idx = (self._hl_hit_idx - 1) % len(self._hl_hit_list)
+        self._scroll_to_hit(self._hl_hit_idx)
+        self._update_hl_info()
+
+    def _scroll_to_hit(self, hit_idx: int):
+        """指定ヒットのページに切り替え、そのボックスが見えるようにスクロールする。"""
+        if hit_idx < 0 or hit_idx >= len(self._hl_hit_list):
+            return
+        pg_idx, x1, y1, x2, y2 = self._hl_hit_list[hit_idx]
+
+        # ページが違う場合は切り替え（fit は維持）
+        if pg_idx != self._current:
+            self._current = pg_idx
+            self._show_page(self._current)
+
+        # ボックス中心にスクロール（ズーム座標に変換）
+        z   = self._zoom
+        cx  = int((x1 + x2) / 2 * z)
+        cy  = int((y1 + y2) / 2 * z)
+        cw  = self._canvas.winfo_width()  or 800
+        ch  = self._canvas.winfo_height() or 600
+        pr  = self._pages[pg_idx]
+        img = pr.image if hasattr(pr, 'image') else pr
+        img_w = int(img.width  * z)
+        img_h = int(img.height * z)
+        if img_w > 0:
+            self._canvas.xview_moveto(max(0.0, (cx - cw // 2) / img_w))
+        if img_h > 0:
+            self._canvas.yview_moveto(max(0.0, (cy - ch // 2) / img_h))
 
     # ──────────────────────────────────────────────────────────────────
     #  サムネイル
     # ──────────────────────────────────────────────────────────────────
 
     def _build_thumbnails(self):
+        """サムネイルを生成してサイドバーに表示する。
+        BILINEAR を使って高速化 (LANCZOS より約3倍速)。
+        """
         # 既存サムネイルをクリア
         for w in self._thumb_inner.winfo_children():
             w.destroy()
         self._thumb_tk_imgs = []
 
-        for i, img in enumerate(self._pages):
-            # サムネイル生成
+        for i, pr in enumerate(self._pages):
+            # PageResult または PIL.Image を吸収
+            img = pr.image if hasattr(pr, 'image') else pr
+
+            # サムネイル生成: BILINEAR で高速化
             thumb = img.copy()
-            thumb.thumbnail((THUMB_W, THUMB_H), Image.LANCZOS)
-            # 背景を白にして中央配置
+            thumb.thumbnail((THUMB_W, THUMB_H), Image.BILINEAR)
             bg = Image.new("RGB", (THUMB_W, THUMB_H), "#3c3c3c")
             ox = (THUMB_W - thumb.width)  // 2
             oy = (THUMB_H - thumb.height) // 2
             bg.paste(thumb, (ox, oy))
 
+            # ヒットがあるページはサムネイルに赤バッジ
+            n_hits = len(getattr(pr, 'hit_boxes', []))
+            if n_hits:
+                from PIL import ImageDraw
+                draw = ImageDraw.Draw(bg)
+                draw.rectangle([0, 0, 36, 13], fill="#e53935")
+                draw.text((2, 1), f"●{n_hits}", fill="white")
+
             tk_img = ImageTk.PhotoImage(bg)
             self._thumb_tk_imgs.append(tk_img)
 
             frame = tk.Frame(self._thumb_inner, bg=BG_SIDEBAR,
-                             cursor="hand2", pady=4)
-            frame.pack(fill=tk.X, padx=6, pady=2)
+                             cursor="hand2", pady=3)
+            frame.pack(fill=tk.X, padx=4, pady=1)
 
             lbl = tk.Label(frame, image=tk_img, bg=BG_SIDEBAR,
                            relief=tk.FLAT, bd=2)
             lbl.pack()
 
-            # レイアウト名
-            layout_name = img.info.get("layout_name", f"ページ {i + 1}")
+            # レイアウト名 + ヒット件数
+            layout_name = (img.info.get("layout_name")
+                           or getattr(pr, 'layout_name', '')
+                           or f"P{i + 1}")
+            hit_badge = f" [{n_hits}]" if n_hits else ""
             page_lbl = tk.Label(frame,
-                                text=f"{layout_name[:20]}",
-                                bg=BG_SIDEBAR, fg=FG_SIDEBAR,
-                                font=FONT_SIDE, wraplength=130)
+                                text=f"{layout_name[:18]}{hit_badge}",
+                                bg=BG_SIDEBAR, fg="#ffd600" if n_hits else FG_SIDEBAR,
+                                font=FONT_SIDE, wraplength=115)
             page_lbl.pack()
 
             idx = i
@@ -283,12 +406,15 @@ class PreviewWindow(tk.Toplevel):
             return
 
         self._current = idx
-        img = self._pages[idx]
+        pr  = self._pages[idx]
+        img = pr.image if hasattr(pr, 'image') else pr
 
         # ズーム適用
         new_w = max(1, int(img.width  * self._zoom))
         new_h = max(1, int(img.height * self._zoom))
-        resized  = img.resize((new_w, new_h), Image.LANCZOS)
+        # ズーム率が高い場合は LANCZOS、低い場合は BILINEAR で高速化
+        filt = Image.LANCZOS if self._zoom >= 1.0 else Image.BILINEAR
+        resized  = img.resize((new_w, new_h), filt)
         tk_img   = ImageTk.PhotoImage(resized)
 
         # 前のイメージを保持（GC 防止）
@@ -303,12 +429,16 @@ class PreviewWindow(tk.Toplevel):
         self._update_page_label()
         self._highlight_thumb(idx)
 
-        layout_name = img.info.get("layout_name", f"ページ {idx + 1}")
+        layout_name = (img.info.get("layout_name")
+                       or getattr(pr, 'layout_name', '')
+                       or f"ページ {idx + 1}")
+        n_hits = len(getattr(pr, 'hit_boxes', []))
+        hit_str = f"  ●{n_hits}箇所ハイライト" if n_hits else ""
         self._status_var.set(
-            f"{layout_name}  |  "
+            f"{layout_name}{hit_str}  |  "
             f"原寸: {img.width}×{img.height}px  |  "
             f"ズーム: {int(self._zoom * 100)}%  |  "
-            f"ヒント: Ctrl+ホイールでズーム / ドラッグでスクロール / F でフィット"
+            f"ヒント: Ctrl+ホイールでズーム / ドラッグ / F=フィット / n=次ヒット / p=前ヒット"
         )
 
     def _update_page_label(self):
@@ -347,12 +477,13 @@ class PreviewWindow(tk.Toplevel):
     def _fit_window(self):
         if not self._pages:
             return
-        img = self._pages[self._current]
+        pr  = self._pages[self._current]
+        img = pr.image if hasattr(pr, 'image') else pr   # PageResult 対応
         cw  = self._canvas.winfo_width()  or 800
         ch  = self._canvas.winfo_height() or 600
-        zw  = cw  / img.width
-        zh  = ch  / img.height
-        self._zoom = max(0.1, min(zw, zh) * 0.97)
+        zw  = cw  / max(img.width,  1)
+        zh  = ch  / max(img.height, 1)
+        self._zoom = max(MIN_ZOOM, min(zw, zh) * 0.97)
         self._show_page(self._current)
 
     # ──────────────────────────────────────────────────────────────────
@@ -394,9 +525,10 @@ class PreviewWindow(tk.Toplevel):
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
-        print("Usage: python preview_panel.py <file>")
+        print("Usage: python preview_panel.py <file> [highlight_text]")
         sys.exit(1)
+    hl = sys.argv[2] if len(sys.argv) > 2 else ""
     root = tk.Tk()
     root.withdraw()
-    win = PreviewWindow(root, sys.argv[1])
+    win = PreviewWindow(root, sys.argv[1], highlight_text=hl)
     root.mainloop()
