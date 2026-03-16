@@ -234,19 +234,31 @@ class DwgExtractor(BaseExtractor):
                     else:
                         os.environ["DISPLAY"] = old_display
 
-            # 以降は DXF と同じ処理
+            # 以降は DXF と同じ処理（レイアウト別セクション形式で保存）
             from .dxf_extractor import _collect_texts_from_layout
             texts: List[str] = []
+            layout_sections: List[str] = []
 
-            texts.extend(_collect_texts_from_layout(doc.modelspace()))
+            model_texts = _collect_texts_from_layout(doc.modelspace())
+            if model_texts:
+                layout_sections.append("[Model]")
+                layout_sections.extend(model_texts)
+            texts.extend(model_texts)
+
             for layout in doc.layouts:
                 if layout.name != "Model":
-                    texts.extend(_collect_texts_from_layout(layout))
+                    lt = _collect_texts_from_layout(layout)
+                    if lt:
+                        layout_sections.append(f"[{layout.name}]")
+                        layout_sections.extend(lt)
+                    texts.extend(lt)
+
             for block in doc.blocks:
                 texts.extend(_collect_texts_from_layout(block))
 
             result.texts = list(dict.fromkeys(t for t in texts if t.strip()))
             result.drawing_numbers = _extract_drawing_numbers(result.texts)
+            result.texts_blob_sections = "\n".join(layout_sections)
             result.raw_metadata = {
                 "dxf_version":     doc.dxfversion,
                 "converted_via":   "ezdxf.addons.odafc",

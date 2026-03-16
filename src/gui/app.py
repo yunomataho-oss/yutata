@@ -22,6 +22,7 @@ import csv
 import datetime
 import io
 import os
+import queue
 import shutil
 import subprocess
 import sys
@@ -339,9 +340,17 @@ class DrawingSearchApp(tk.Tk):
         self._inline_tk_img   = None      # GC 防止
         self._inline_current  = 0
         self._inline_zoom     = 1.0
+        self._inline_src_img  = None      # オリジナル PIL Image (resize 元)
         # プレビューデバウンス・キャンセル制御
         self._preview_token: int = 0   # リクエストごとにインクリメント
-        self._preview_after_id = None  # after() ID (デバウンス用)
+        self._preview_after_id = None  # after() ID (ロードデバウンス用)
+        self._zoom_after_id    = None  # after() ID (ズームデバウンス用)
+        # シングルワーカースレッド: Queue 経由で逐次処理
+        self._preview_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._preview_worker_thread = threading.Thread(
+            target=self._preview_worker_loop, daemon=True
+        )
+        self._preview_worker_thread.start()
 
         # キャンバスドラッグ
         self._preview_canvas.bind("<ButtonPress-1>",  self._prev_drag_start)
@@ -468,8 +477,21 @@ class DrawingSearchApp(tk.Tk):
     #  Inline Preview Methods                                              #
     # ------------------------------------------------------------------ #
 
+    # ------------------------------------------------------------------ #
+    #  プレビュー: エクスプローラー風・低負荷設計                              #
+    # ------------------------------------------------------------------ #
+    # 設計方針:
+    #   1. シングルワーカースレッド + maxsize=1 Queue
+    #      → 連打しても最新リクエスト1件だけ処理。複数スレッドの生成なし
+    #   2. ezdxf.readfile を worker 内でのみ呼ぶ (UI スレッドでは一切ファイル I/O 不可)
+    #      _resolve_target は texts_blob テキストのみで判定 → 追加ファイル読み込み不要
+    #   3. resize も worker 内で完了させ、UI スレッドには PhotoImage を渡すだけ
+    #   4. ズームは 100ms デバウンス → ホイール連打で resize が連発しない
+    #   5. 高解像度元画像を _inline_src_img に保持 → ズームのたびに再レンダリング不要
+    # ------------------------------------------------------------------
+
     def _show_preview_placeholder(self, message: str):
-        """プレビューキャンバスにメッセージを表示する。"""
+        """プレビューキャンバスにメッセージを表示する（UIスレッドのみ）。"""
         self._preview_canvas.delete("all")
         w = max(self._preview_canvas.winfo_width(),  300)
         h = max(self._preview_canvas.winfo_height(), 200)
@@ -479,185 +501,274 @@ class DrawingSearchApp(tk.Tk):
             font=("Helvetica", 13), justify=tk.CENTER,
         )
 
+    # ── ロード要求（UIスレッド） ─────────────────────────────────────────
+
     def _load_inline_preview(self, result):
-        """バックグラウンドスレッドでプレビュー画像を生成する（デバウンス付き）。"""
-        # デバウンス: 250ms 以内に連続選択された場合は最後だけ処理 (CPU負荷削減)
+        """
+        デバウンス付きプレビューロード要求。
+        250ms 以内の連続選択は最後の 1 件だけ処理する。
+        """
         if self._preview_after_id is not None:
             self.after_cancel(self._preview_after_id)
         self._preview_after_id = self.after(
-            250, lambda: self._start_preview_load(result)
+            250, lambda: self._enqueue_preview(result)
         )
 
+    def _enqueue_preview(self, result):
+        """
+        ワーカーキューにリクエストを投入する。
+        maxsize=1 の Queue なので古いリクエストを捨てて最新だけ保持する。
+        """
+        self._preview_after_id = None
+        self._preview_token += 1
+        token = self._preview_token
+
+        self._inline_src_img  = None
+        self._inline_pages    = []
+        self._inline_current  = 0
+        self._inline_zoom     = 1.0
+        self._show_preview_placeholder("🔄 読み込み中...")
+
+        # キューが溢れていたら古いリクエストを捨てる
+        try:
+            self._preview_queue.get_nowait()
+        except queue.Empty:
+            pass
+        self._preview_queue.put((token, result))
+
+    # ── シングルワーカースレッド ─────────────────────────────────────────
+
+    def _preview_worker_loop(self):
+        """
+        シングルデーモンスレッドとして常駐するワーカーループ。
+        Queue からリクエストを1件ずつ取り出して処理する。
+        ・ファイル I/O (ezdxf.readfile / fitz) はここだけで行う
+        ・resize もここで完結させ、UIスレッドには PhotoImage のみ渡す
+        """
+        while True:
+            try:
+                token, result = self._preview_queue.get()  # ブロッキング
+            except Exception:
+                continue
+
+            try:
+                tk_img, src_img, layout_name = self._render_for_display(
+                    token, result
+                )
+            except Exception:
+                tk_img = src_img = layout_name = None
+
+            # トークンが既に更新されていたら結果を捨てる
+            if token != self._preview_token:
+                continue
+
+            # UI スレッドに描画を委託
+            self.after(0, lambda ti=tk_img, si=src_img, ln=layout_name, t=token:
+                       self._apply_preview_result(ti, si, ln, t))
+
+    def _render_for_display(
+        self, token: int, result
+    ):
+        """
+        ワーカースレッド内でファイルを読み込み、表示用 PhotoImage まで生成する。
+        戻り値: (ImageTk.PhotoImage, PIL.Image, layout_name: str)
+        """
+        from src.preview.preview_engine import get_preview, _make_error_image, PageResult
+        from PIL import Image as _Image, ImageTk
+
+        file_path = result.entry.file_path
+
+        # ── target_layout / target_page を texts_blob だけで決定 ─────────
+        # ★ ezdxf.readfile を追加で呼ばない。texts_blob のテキストで判定する。
+        target_layout, target_page = self._resolve_target_from_blob(result)
+
+        # トークンが変わったら即中断
+        if token != self._preview_token:
+            return None, None, ""
+
+        try:
+            pages = get_preview(
+                file_path, self._config,
+                max_pages=1,
+                target_layout=target_layout,
+                target_page=target_page,
+            )
+        except Exception as exc:
+            pages = [PageResult(_make_error_image("プレビューエラー", str(exc)))]
+
+        if token != self._preview_token:
+            return None, None, ""
+
+        pr  = pages[0] if pages else PageResult(_make_error_image("空", ""))
+        img = pr.image if hasattr(pr, 'image') else pr
+        layout_name = img.info.get("layout_name") or getattr(pr, 'layout_name', '') or ""
+
+        # ── キャンバスサイズに合わせてリサイズ（ワーカー内で完結）────────
+        cw = max(self._preview_canvas.winfo_width(),  300)
+        ch = max(self._preview_canvas.winfo_height(), 200)
+        zw = cw / max(img.width,  1)
+        zh = ch / max(img.height, 1)
+        zoom = min(zw, zh) * 0.97
+        zoom = max(0.05, min(zoom, 4.0))
+
+        new_w = max(1, int(img.width  * zoom))
+        new_h = max(1, int(img.height * zoom))
+        filt  = _Image.BILINEAR if zoom >= 1.0 else _Image.NEAREST
+        resized   = img.resize((new_w, new_h), filt)
+        tk_img    = ImageTk.PhotoImage(resized)
+
+        # zoom 値を img.info に記録して UI スレッドに伝える
+        img.info["_zoom"] = zoom
+
+        return tk_img, img, layout_name
+
+    # ── texts_blob のみからレイアウトを推定（ファイル再読み込みなし）────
+
     @staticmethod
-    def _resolve_target(result) -> tuple:
+    def _resolve_target_from_blob(result) -> tuple:
         """
-        SearchResult から対象レイアウト名 (DXF/DWG) またはページ番号 (PDF) を導出する。
-        戻り値: (target_layout: str|None, target_page: int|None)
+        IndexEntry.texts_blob のみを使って target_layout / target_page を決定する。
+        ezdxf.readfile などの I/O は一切行わない。
+
+        DXF/DWG の texts_blob は "[レイアウト名]\nテキスト1\nテキスト2\n..." 形式で
+        各レイアウトのテキストが記録されている。
+        その形式を利用してマッチしたテキストが属するレイアウト名を推定する。
         """
+        import re as _re
         entry      = result.entry
         ext        = os.path.splitext(entry.file_path)[1].lower()
         match_type = result.match_type
-        matched    = result.matched_value  # マッチした文字列
+        matched    = result.matched_value
 
         target_layout: Optional[str] = None
         target_page:   Optional[int] = None
 
         if ext in (".dxf", ".dwg"):
-            # full_text マッチの場合: matched_value を含むレイアウトを探す
             if match_type == "full_text" and matched.strip():
-                try:
-                    import ezdxf
-                    doc = ezdxf.readfile(entry.file_path)
-                    from src.extractors.dxf_extractor import _collect_texts_from_layout
-                    import re
-                    pattern = re.compile(re.escape(matched.strip()), re.IGNORECASE)
-                    # paper space → model space の順で探す
-                    all_names = list(doc.layouts.names())
-                    ordered   = [n for n in all_names if n != "Model"] + \
-                                [n for n in all_names if n == "Model"]
-                    for name in ordered:
-                        layout = doc.layouts.get(name)
-                        texts  = _collect_texts_from_layout(layout)
-                        if any(pattern.search(t) for t in texts):
+                # texts_blob から "[レイアウト名]" セクションヘッダーを探す
+                blob = entry.texts_blob or ""
+                # セクション区切りパターン: 先頭に "[名前]" がある行
+                sections = _re.split(r'(?m)^\[([^\]]+)\]\s*$', blob)
+                # sections = [前文, 名前1, 本文1, 名前2, 本文2, ...]
+                pattern = _re.compile(_re.escape(matched.strip()), _re.IGNORECASE)
+                if len(sections) >= 3:
+                    # セクション形式のときだけレイアウト特定を試みる
+                    for i in range(1, len(sections) - 1, 2):
+                        name, body = sections[i], sections[i + 1]
+                        if pattern.search(body):
                             target_layout = name
                             break
-                except Exception:
-                    pass  # フォールバック: 全レイアウト
-            # drawing_number / filename: 最初のページ(デフォルト)で十分
+                # セクション形式でなければ None のまま（全レイアウト）
 
         elif ext == ".pdf":
-            # PDF ページ番号の特定は texts_blob から困難なため常に先頭ページ
             target_page = 0
 
         return target_layout, target_page
 
-    def _start_preview_load(self, result):
-        """実際のレンダリング開始（デバウンス後に呼ばれる）。"""
-        self._preview_after_id = None
-        # トークンを更新: 古いワーカーの結果は無視される
-        self._preview_token += 1
-        token     = self._preview_token
-        file_path = result.entry.file_path
+    # ── 描画適用（UIスレッド） ─────────────────────────────────────────
 
-        self._show_preview_placeholder("🔄 レンダリング中...")
-        self._inline_pages   = []
-        self._inline_current = 0
-        self._inline_zoom    = 1.0
-
-        def worker():
-            from src.preview.preview_engine import get_preview, _make_error_image, PageResult
-            try:
-                target_layout, target_page = self._resolve_target(result)
-                pages = get_preview(
-                    file_path, self._config,
-                    max_pages=1,
-                    target_layout=target_layout,
-                    target_page=target_page,
-                )
-            except Exception as exc:
-                pages = [PageResult(_make_error_image("プレビューエラー", str(exc)))]
-            # トークンが変わっていたら（別の選択が来た）何もしない
-            if token == self._preview_token:
-                self.after(0, lambda: self._on_inline_loaded(pages))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_inline_loaded(self, pages):
-        self._inline_pages   = pages
-        self._inline_current = 0
-        self._inline_zoom    = 1.0
-        self._draw_inline_page()
-
-    def _draw_inline_page(self):
-        """現在のページをインラインキャンバスに描画する。"""
-        if not self._inline_pages:
+    def _apply_preview_result(
+        self,
+        tk_img,         # ImageTk.PhotoImage | None
+        src_img,        # PIL.Image          | None
+        layout_name: str,
+        token: int,
+    ):
+        """ワーカーから渡された完成済み PhotoImage をキャンバスに貼るだけ。"""
+        if token != self._preview_token:
+            return
+        if tk_img is None:
+            self._show_preview_placeholder("プレビューを表示できませんでした")
             return
 
-        idx = self._inline_current
-        pr  = self._inline_pages[idx]
+        zoom = src_img.info.get("_zoom", 1.0) if src_img else 1.0
+        self._inline_zoom    = zoom
+        self._inline_src_img = src_img
+        self._inline_tk_img  = tk_img   # GC 防止
 
-        # PageResult または PIL.Image を吸収
-        img = pr.image if hasattr(pr, 'image') else pr
-
-        # ウィンドウ幅に合わせて自動フィット（初回のみ zoom=1 → fit に調整）
-        cw = max(self._preview_canvas.winfo_width(),  300)
-        ch = max(self._preview_canvas.winfo_height(), 200)
-        if self._inline_zoom == 1.0:
-            zw = cw / img.width
-            zh = ch / img.height
-            self._inline_zoom = min(zw, zh) * 0.97
-
-        new_w = max(1, int(img.width  * self._inline_zoom))
-        new_h = max(1, int(img.height * self._inline_zoom))
-        from PIL import Image as _Image, ImageTk
-        # 縮小時は NEAREST (最高速)、拡大時は BILINEAR (LANCZOSは不要なほど重い)
-        if self._inline_zoom >= 1.0:
-            filt = _Image.BILINEAR
-        else:
-            filt = _Image.NEAREST
-        resized = img.resize((new_w, new_h), filt)
-        self._inline_tk_img = ImageTk.PhotoImage(resized)   # GC 防止
-
+        w = tk_img.width()
+        h = tk_img.height()
         self._preview_canvas.delete("all")
-        self._preview_canvas.create_image(0, 0, anchor=tk.NW,
-                                           image=self._inline_tk_img)
-        self._preview_canvas.configure(scrollregion=(0, 0, new_w, new_h))
+        self._preview_canvas.create_image(0, 0, anchor=tk.NW, image=tk_img)
+        self._preview_canvas.configure(scrollregion=(0, 0, w, h))
         self._preview_canvas.xview_moveto(0)
         self._preview_canvas.yview_moveto(0)
 
-        layout = img.info.get("layout_name") or getattr(pr, 'layout_name', '') or ""
-        self._inline_page_label.config(text=layout)
-        self._inline_zoom_label.config(text=f"{int(self._inline_zoom * 100)}%")
-
+        self._inline_page_label.config(text=layout_name)
+        self._inline_zoom_label.config(text=f"{int(zoom * 100)}%")
         self._status_var.set(
-            f"{layout}  |  ズーム: {int(self._inline_zoom * 100)}%  |  "
+            f"{layout_name}  |  ズーム: {int(zoom * 100)}%  |  "
             "Ctrl+ホイールでズーム / ドラッグでスクロール / ダブルクリックで別ウィンドウ(全ページ)"
         )
 
-    def _inline_prev_page(self):
-        if self._inline_current > 0:
-            self._inline_current -= 1
-            self._inline_zoom = 1.0
-            self._draw_inline_page()
-
-    def _inline_next_page(self):
-        if self._inline_pages and self._inline_current < len(self._inline_pages) - 1:
-            self._inline_current += 1
-            self._inline_zoom = 1.0
-            self._draw_inline_page()
+    # ── ズーム（UIスレッド、デバウンス付き）─────────────────────────────
 
     def _inline_zoom_in(self):
         self._inline_zoom = min(4.0, self._inline_zoom + 0.15)
-        self._redraw_inline()
+        self._schedule_zoom_redraw()
 
     def _inline_zoom_out(self):
-        self._inline_zoom = max(0.1, self._inline_zoom - 0.15)
-        self._redraw_inline()
+        self._inline_zoom = max(0.05, self._inline_zoom - 0.15)
+        self._schedule_zoom_redraw()
 
     def _inline_fit(self):
-        self._inline_zoom = 1.0   # trigger auto-fit in draw
-        self._draw_inline_page()
-
-    def _redraw_inline(self):
-        if not self._inline_pages:
+        """キャンバスにフィットするズーム率を再計算して再描画。"""
+        if self._inline_src_img is None:
             return
-        idx = self._inline_current
-        pr  = self._inline_pages[idx]
-        img = pr.image if hasattr(pr, 'image') else pr
-        new_w = max(1, int(img.width  * self._inline_zoom))
-        new_h = max(1, int(img.height * self._inline_zoom))
-        from PIL import Image as _Image, ImageTk
-        # 縮小時は NEAREST (最高速)、拡大時は BILINEAR
-        if self._inline_zoom >= 1.0:
-            filt = _Image.BILINEAR
-        else:
-            filt = _Image.NEAREST
-        resized = img.resize((new_w, new_h), filt)
-        self._inline_tk_img = ImageTk.PhotoImage(resized)
+        img = self._inline_src_img
+        cw  = max(self._preview_canvas.winfo_width(),  300)
+        ch  = max(self._preview_canvas.winfo_height(), 200)
+        zw  = cw / max(img.width,  1)
+        zh  = ch / max(img.height, 1)
+        self._inline_zoom = min(zw, zh) * 0.97
+        self._schedule_zoom_redraw()
+
+    def _schedule_zoom_redraw(self):
+        """
+        ズーム操作を 100ms デバウンスして _do_zoom_redraw を呼ぶ。
+        ホイール連打による連続 resize を防ぐ。
+        """
+        if self._zoom_after_id is not None:
+            self.after_cancel(self._zoom_after_id)
+        self._zoom_after_id = self.after(100, self._do_zoom_redraw)
+
+    def _do_zoom_redraw(self):
+        """
+        ズーム後の resize をバックグラウンドで実行する。
+        _inline_src_img（高解像度元画像）から resize するので
+        get_preview の再呼び出しは不要。
+        """
+        self._zoom_after_id = None
+        if self._inline_src_img is None:
+            return
+
+        zoom    = self._inline_zoom
+        src_img = self._inline_src_img
+        token   = self._preview_token
+
+        def _worker():
+            from PIL import Image as _Image, ImageTk
+            new_w = max(1, int(src_img.width  * zoom))
+            new_h = max(1, int(src_img.height * zoom))
+            filt  = _Image.BILINEAR if zoom >= 1.0 else _Image.NEAREST
+            resized = src_img.resize((new_w, new_h), filt)
+            tk_img  = ImageTk.PhotoImage(resized)
+            if token == self._preview_token:
+                self.after(0, lambda: self._apply_zoom_result(tk_img, zoom, new_w, new_h, token))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_zoom_result(self, tk_img, zoom, w, h, token):
+        """ズーム後の PhotoImage をキャンバスに反映（UIスレッド）。"""
+        if token != self._preview_token:
+            return
+        self._inline_tk_img = tk_img   # GC 防止
         self._preview_canvas.delete("all")
-        self._preview_canvas.create_image(0, 0, anchor=tk.NW, image=self._inline_tk_img)
-        self._preview_canvas.configure(scrollregion=(0, 0, new_w, new_h))
-        self._inline_zoom_label.config(text=f"{int(self._inline_zoom * 100)}%")
+        self._preview_canvas.create_image(0, 0, anchor=tk.NW, image=tk_img)
+        self._preview_canvas.configure(scrollregion=(0, 0, w, h))
+        self._inline_zoom_label.config(text=f"{int(zoom * 100)}%")
+
+    # ── スクロール / ドラッグ ────────────────────────────────────────────
 
     def _prev_drag_start(self, event):
         self._preview_canvas.scan_mark(event.x, event.y)

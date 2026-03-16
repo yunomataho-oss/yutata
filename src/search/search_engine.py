@@ -227,7 +227,11 @@ class DrawingSearchEngine:
             file_type=result.file_type,
             filename=result.filename,
             drawing_numbers=result.drawing_numbers,
-            texts_blob=" ".join(result.texts),
+            # DXF/DWG はセクション形式 blob を優先（レイアウト判定に使用）
+            # その他はフラットなスペース結合
+            texts_blob=(result.texts_blob_sections
+                        if result.texts_blob_sections
+                        else " ".join(result.texts)),
             title=result.title,
             indexed_at=time.time(),
             error=result.error,

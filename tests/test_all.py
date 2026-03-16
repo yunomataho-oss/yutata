@@ -518,3 +518,94 @@ class TestCsvExport:
         header = rows[0]
         error_idx = header.index("エラー")
         assert rows[1][error_idx] == "Parse failed"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  _resolve_target_from_blob (no file I/O, uses only texts_blob)
+# ────────────────────────────────────────────────────────────────────────────
+
+class TestResolveTargetFromBlob:
+    """Tests for DrawingSearchApp._resolve_target_from_blob."""
+
+    def _make_result(self, file_path, match_type, matched_value, texts_blob=""):
+        from src.search.search_engine import IndexEntry, SearchResult
+        entry = IndexEntry(
+            file_path=file_path,
+            file_type="dxf",
+            filename=os.path.basename(file_path),
+            drawing_numbers=[],
+            texts_blob=texts_blob,
+            title=None,
+            indexed_at="2026-01-01T00:00:00",
+            error=None,
+            file_mtime=0.0,
+            file_size=0,
+        )
+        return SearchResult(entry=entry, match_type=match_type,
+                            matched_value=matched_value, score=0.9)
+
+    def test_pdf_always_returns_page_zero(self, tmp_path):
+        from src.gui.app import DrawingSearchApp
+        r = self._make_result(str(tmp_path / "doc.pdf"), "drawing_number", "DRW-001")
+        layout, page = DrawingSearchApp._resolve_target_from_blob(r)
+        assert layout is None
+        assert page == 0
+
+    def test_dxf_drawing_number_returns_none_layout(self, tmp_path):
+        from src.gui.app import DrawingSearchApp
+        r = self._make_result(str(tmp_path / "f.dxf"), "drawing_number", "DRW-001",
+                              texts_blob="[Sheet1]\nDRW-001\n[Model]\nsome text")
+        layout, page = DrawingSearchApp._resolve_target_from_blob(r)
+        assert layout is None
+        assert page is None
+
+    def test_dxf_fulltext_finds_layout_by_blob(self, tmp_path):
+        from src.gui.app import DrawingSearchApp
+        blob = "[Sheet1]\nSPECIAL_TXT\nother\n[Model]\nModel content"
+        r = self._make_result(str(tmp_path / "f.dxf"), "full_text", "SPECIAL_TXT",
+                              texts_blob=blob)
+        layout, page = DrawingSearchApp._resolve_target_from_blob(r)
+        assert layout == "Sheet1"
+        assert page is None
+
+    def test_dxf_fulltext_finds_model_layout(self, tmp_path):
+        from src.gui.app import DrawingSearchApp
+        blob = "[Sheet1]\nOther text\n[Model]\nMODEL_KEYWORD here"
+        r = self._make_result(str(tmp_path / "f.dxf"), "full_text", "MODEL_KEYWORD",
+                              texts_blob=blob)
+        layout, page = DrawingSearchApp._resolve_target_from_blob(r)
+        assert layout == "Model"
+
+    def test_dxf_fulltext_no_match_returns_none(self, tmp_path):
+        from src.gui.app import DrawingSearchApp
+        blob = "[Sheet1]\nsome text\n[Model]\nother text"
+        r = self._make_result(str(tmp_path / "f.dxf"), "full_text", "NOTFOUND",
+                              texts_blob=blob)
+        layout, page = DrawingSearchApp._resolve_target_from_blob(r)
+        assert layout is None
+
+    def test_dxf_fulltext_no_sections_returns_none(self, tmp_path):
+        """When texts_blob has no [Layout] headers, layout should be None."""
+        from src.gui.app import DrawingSearchApp
+        blob = "plain text without sections KEYWORD here"
+        r = self._make_result(str(tmp_path / "f.dxf"), "full_text", "KEYWORD",
+                              texts_blob=blob)
+        layout, page = DrawingSearchApp._resolve_target_from_blob(r)
+        assert layout is None
+
+    def test_dwg_fulltext_finds_layout(self, tmp_path):
+        from src.gui.app import DrawingSearchApp
+        blob = "[PaperSpace1]\nDWG_MATCH\n[Model]\nno match"
+        r = self._make_result(str(tmp_path / "f.dwg"), "full_text", "DWG_MATCH",
+                              texts_blob=blob)
+        r.entry.file_type = "dwg"
+        layout, page = DrawingSearchApp._resolve_target_from_blob(r)
+        assert layout == "PaperSpace1"
+
+    def test_case_insensitive_match(self, tmp_path):
+        from src.gui.app import DrawingSearchApp
+        blob = "[Sheet1]\nDrawing Title ABC\n[Model]\nno"
+        r = self._make_result(str(tmp_path / "f.dxf"), "full_text", "drawing title abc",
+                              texts_blob=blob)
+        layout, page = DrawingSearchApp._resolve_target_from_blob(r)
+        assert layout == "Sheet1"
