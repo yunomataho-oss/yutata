@@ -1,9 +1,11 @@
 """
-Unit tests for all extractor modules and the search engine.
+Unit tests for all extractor modules, the search engine, and CSV export.
 Run with: pytest tests/ -v
 """
 from __future__ import annotations
 
+import csv
+import io
 import os
 import sys
 import tempfile
@@ -364,3 +366,155 @@ class TestSearchEngine:
         for i in range(10):
             results = engine.search(f"PAR-{i:04d}")
             assert len(results) >= 1, f"PAR-{i:04d} not found after parallel index"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  CSV Export
+# ────────────────────────────────────────────────────────────────────────────
+
+class TestCsvExport:
+    """Tests for _write_results_csv and _write_index_csv static methods."""
+
+    def _make_entry(self, tmp_path, filename="test.pdf", drawing_numbers=None,
+                    file_type="pdf", title=None, error=None, texts="sample text"):
+        from src.search.search_engine import IndexEntry
+        fp = str(tmp_path / filename)
+        return IndexEntry(
+            file_path=fp,
+            file_type=file_type,
+            filename=filename,
+            drawing_numbers=drawing_numbers or ["DRW-001"],
+            texts_blob=texts,
+            title=title,
+            indexed_at="2026-01-01T00:00:00",
+            error=error,
+            file_mtime=0.0,
+            file_size=0,
+        )
+
+    def _make_result(self, entry, match_type="drawing_number", matched_value="DRW-001", score=0.95):
+        from src.search.search_engine import SearchResult
+        return SearchResult(entry=entry, match_type=match_type, matched_value=matched_value, score=score)
+
+    def test_results_csv_has_header(self, tmp_path):
+        from src.gui.app import DrawingSearchApp
+        entry = self._make_entry(tmp_path)
+        results = [self._make_result(entry)]
+        out = str(tmp_path / "results.csv")
+        DrawingSearchApp._write_results_csv(out, results)
+        with open(out, encoding="utf-8-sig") as f:
+            rows = list(csv.reader(f))
+        header = rows[0]
+        assert "ファイル名" in header
+        assert "図面番号" in header
+        assert "マッチ値" in header
+        assert "ファイルパス" in header
+
+    def test_results_csv_data_row(self, tmp_path):
+        from src.gui.app import DrawingSearchApp
+        entry = self._make_entry(tmp_path, drawing_numbers=["DRW-999"], title="My Title")
+        results = [self._make_result(entry, matched_value="DRW-999", score=0.88)]
+        out = str(tmp_path / "results.csv")
+        DrawingSearchApp._write_results_csv(out, results)
+        with open(out, encoding="utf-8-sig") as f:
+            rows = list(csv.reader(f))
+        assert len(rows) == 2  # header + 1 data row
+        row = rows[1]
+        assert "DRW-999" in row
+        assert "My Title" in row
+        assert "0.880" in row
+
+    def test_results_csv_multiple_drawing_numbers(self, tmp_path):
+        from src.gui.app import DrawingSearchApp
+        entry = self._make_entry(tmp_path, drawing_numbers=["DRW-001", "DRW-002", "DRW-003"])
+        results = [self._make_result(entry)]
+        out = str(tmp_path / "results.csv")
+        DrawingSearchApp._write_results_csv(out, results)
+        with open(out, encoding="utf-8-sig") as f:
+            rows = list(csv.reader(f))
+        row = rows[1]
+        # Drawing numbers should be joined with "; "
+        drawing_col = row[1]  # index 1 = 図面番号
+        assert "DRW-001" in drawing_col
+        assert "DRW-002" in drawing_col
+
+    def test_results_csv_empty_list(self, tmp_path):
+        from src.gui.app import DrawingSearchApp
+        out = str(tmp_path / "empty.csv")
+        DrawingSearchApp._write_results_csv(out, [])
+        with open(out, encoding="utf-8-sig") as f:
+            rows = list(csv.reader(f))
+        assert len(rows) == 1  # header only
+        assert "ファイル名" in rows[0]
+
+    def test_results_csv_utf8_bom(self, tmp_path):
+        from src.gui.app import DrawingSearchApp
+        entry = self._make_entry(tmp_path, filename="テスト図面.pdf", title="テストタイトル")
+        results = [self._make_result(entry)]
+        out = str(tmp_path / "results.csv")
+        DrawingSearchApp._write_results_csv(out, results)
+        with open(out, "rb") as f:
+            header_bytes = f.read(3)
+        # UTF-8 BOM = EF BB BF
+        assert header_bytes == b"\xef\xbb\xbf", "File should start with UTF-8 BOM for Excel compatibility"
+
+    def test_results_csv_path_and_folder(self, tmp_path):
+        from src.gui.app import DrawingSearchApp
+        entry = self._make_entry(tmp_path)
+        results = [self._make_result(entry)]
+        out = str(tmp_path / "results.csv")
+        DrawingSearchApp._write_results_csv(out, results)
+        with open(out, encoding="utf-8-sig") as f:
+            rows = list(csv.reader(f))
+        header = rows[0]
+        path_idx = header.index("ファイルパス")
+        folder_idx = header.index("フォルダ")
+        row = rows[1]
+        assert row[path_idx] == entry.file_path
+        assert row[folder_idx] == os.path.dirname(entry.file_path)
+
+    def test_index_csv_has_header(self, tmp_path):
+        from src.gui.app import DrawingSearchApp
+        entries = [self._make_entry(tmp_path)]
+        out = str(tmp_path / "index.csv")
+        DrawingSearchApp._write_index_csv(out, entries)
+        with open(out, encoding="utf-8-sig") as f:
+            rows = list(csv.reader(f))
+        header = rows[0]
+        assert "ファイル名" in header
+        assert "ファイル種別" in header
+        assert "図面番号" in header
+        assert "ファイルパス" in header
+
+    def test_index_csv_texts_blob_truncated(self, tmp_path):
+        from src.gui.app import DrawingSearchApp
+        long_text = "A" * 1000
+        entry = self._make_entry(tmp_path, texts=long_text)
+        out = str(tmp_path / "index.csv")
+        DrawingSearchApp._write_index_csv(out, [entry])
+        with open(out, encoding="utf-8-sig") as f:
+            rows = list(csv.reader(f))
+        header = rows[0]
+        text_idx = header.index("抽出テキスト冒頭500字")
+        row = rows[1]
+        assert len(row[text_idx]) <= 500
+
+    def test_index_csv_empty_list(self, tmp_path):
+        from src.gui.app import DrawingSearchApp
+        out = str(tmp_path / "empty_index.csv")
+        DrawingSearchApp._write_index_csv(out, [])
+        with open(out, encoding="utf-8-sig") as f:
+            rows = list(csv.reader(f))
+        assert len(rows) == 1  # header only
+
+    def test_results_csv_error_field(self, tmp_path):
+        from src.gui.app import DrawingSearchApp
+        entry = self._make_entry(tmp_path, error="Parse failed")
+        results = [self._make_result(entry)]
+        out = str(tmp_path / "results.csv")
+        DrawingSearchApp._write_results_csv(out, results)
+        with open(out, encoding="utf-8-sig") as f:
+            rows = list(csv.reader(f))
+        header = rows[0]
+        error_idx = header.index("エラー")
+        assert rows[1][error_idx] == "Parse failed"

@@ -18,6 +18,9 @@ Menubar: File > Index Folder / Index File / Clear Index / Exit
 """
 from __future__ import annotations
 
+import csv
+import datetime
+import io
 import os
 import shutil
 import subprocess
@@ -116,9 +119,14 @@ class DrawingSearchApp(tk.Tk):
         file_menu.add_command(label="インデックスをクリア (Clear Index)",
                               command=self._clear_index)
         file_menu.add_separator()
+        file_menu.add_command(label="検索結果を CSV で保存… (Export Results to CSV)",
+                              command=self._export_csv,
+                              accelerator="Ctrl+Shift+E")
+        file_menu.add_separator()
         file_menu.add_command(label="終了 (Exit)", command=self._on_close, accelerator="Alt+F4")
         menubar.add_cascade(label="ファイル (File)", menu=file_menu)
         self.bind_all("<Control-o>", lambda _e: self._index_folder())
+        self.bind_all("<Control-E>", lambda _e: self._export_csv())
 
         # View menu
         view_menu = tk.Menu(menubar, tearoff=0)
@@ -186,6 +194,16 @@ class DrawingSearchApp(tk.Tk):
         )
         search_btn.pack(side=tk.LEFT, padx=(0, 10))
 
+        # CSV export button
+        csv_btn = tk.Button(
+            toolbar, text="📋 CSV出力", font=FONT_MAIN,
+            bg="#2e7d32", fg="white", relief=tk.FLAT,
+            padx=10, pady=4,
+            command=self._export_csv,
+            cursor="hand2",
+        )
+        csv_btn.pack(side=tk.RIGHT, padx=(0, 6))
+
         # Index folder button (quick access)
         index_btn = tk.Button(
             toolbar, text="📂 フォルダ登録 (Index Folder)", font=FONT_MAIN,
@@ -245,6 +263,8 @@ class DrawingSearchApp(tk.Tk):
         ctx.add_command(label="ファイルを開く (Open File)",      command=self._open_file)
         ctx.add_command(label="フォルダを開く (Open Folder)",    command=self._open_containing_folder)
         ctx.add_command(label="パスをコピー (Copy Path)",         command=self._copy_path)
+        ctx.add_separator()
+        ctx.add_command(label="📋 検索結果を CSV で保存…",        command=self._export_csv)
         self._tree.bind("<Button-3>", lambda e: ctx.post(e.x_root, e.y_root))
 
         # ---- 詳細テキスト ----
@@ -847,6 +867,158 @@ class DrawingSearchApp(tk.Tk):
             self._tree.delete(*self._tree.get_children())
             self._clear_detail()
             self._status_var.set("インデックスをクリアしました。")
+
+    # ------------------------------------------------------------------ #
+    #  CSV Export                                                          #
+    # ------------------------------------------------------------------ #
+
+    def _export_csv(self, *_):
+        """検索結果をCSVファイルに保存するダイアログを開く。"""
+        # 出力対象を選択
+        if self._results:
+            choice = self._ask_csv_target()
+            if choice is None:
+                return   # キャンセル
+        else:
+            # 検索結果がない場合はインデックス全件を対象にする
+            choice = "index"
+
+        # 保存先ダイアログ
+        ts    = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"search_results_{ts}.csv" if choice == "results" else f"index_all_{ts}.csv"
+        save_path = filedialog.asksaveasfilename(
+            title="CSV を保存 (Save CSV)",
+            initialfile=default_name,
+            defaultextension=".csv",
+            filetypes=[("CSV ファイル", "*.csv"), ("すべてのファイル", "*")],
+        )
+        if not save_path:
+            return
+
+        try:
+            if choice == "results":
+                self._write_results_csv(save_path, self._results)
+                count = len(self._results)
+            else:
+                self._write_index_csv(save_path, list(self.engine.indexed_files))
+                count = self.engine.index_size
+
+            self._status_var.set(f"CSV 保存完了: {count} 件 → {save_path}")
+
+            # 保存後に開くか確認
+            if messagebox.askyesno(
+                "CSV 保存完了",
+                f"{count} 件を保存しました。\n\n{save_path}\n\nファイルを開きますか？",
+            ):
+                self._os_open(save_path)
+
+        except Exception as exc:
+            messagebox.showerror("CSV 保存エラー", str(exc))
+
+    def _ask_csv_target(self) -> Optional[str]:
+        """検索結果 / インデックス全件 のどちらを出力するか選択させる。"""
+        win = tk.Toplevel(self)
+        win.title("CSV 出力対象")
+        win.resizable(False, False)
+        win.grab_set()
+
+        # ウィンドウを親の中央に配置
+        self.update_idletasks()
+        px, py = self.winfo_rootx(), self.winfo_rooty()
+        pw, ph = self.winfo_width(), self.winfo_height()
+        win.geometry(f"340x160+{px + pw//2 - 170}+{py + ph//2 - 80}")
+
+        choice = tk.StringVar(value="results")
+
+        tk.Label(win, text="出力する内容を選択してください",
+                 font=FONT_BOLD, pady=8).pack()
+        tk.Radiobutton(
+            win, text=f"現在の検索結果 ({len(self._results)} 件)",
+            variable=choice, value="results", font=FONT_MAIN,
+        ).pack(anchor=tk.W, padx=24)
+        tk.Radiobutton(
+            win, text=f"インデックス全件 ({self.engine.index_size} 件)",
+            variable=choice, value="index", font=FONT_MAIN,
+        ).pack(anchor=tk.W, padx=24)
+
+        result: List[Optional[str]] = [None]
+
+        def ok():
+            result[0] = choice.get()
+            win.destroy()
+
+        def cancel():
+            win.destroy()
+
+        btn_frame = tk.Frame(win)
+        btn_frame.pack(pady=10)
+        tk.Button(btn_frame, text="OK",       width=10, command=ok,     bg="#1565c0", fg="white").pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_frame, text="キャンセル", width=10, command=cancel, bg="#546e7a", fg="white").pack(side=tk.LEFT, padx=6)
+
+        win.bind("<Return>", lambda _: ok())
+        win.bind("<Escape>", lambda _: cancel())
+        win.wait_window()
+        return result[0]
+
+    @staticmethod
+    def _write_results_csv(path: str, results: List[SearchResult]):
+        """検索結果リストを CSV に書き出す。"""
+        # BOM 付き UTF-8 で保存 (Excel でも文字化けしない)
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "ファイル名",
+                "図面番号",
+                "マッチ種別",
+                "マッチ値",
+                "スコア",
+                "ファイル種別",
+                "タイトル",
+                "エラー",
+                "ファイルパス",
+                "フォルダ",
+            ])
+            for r in results:
+                e = r.entry
+                writer.writerow([
+                    e.filename,
+                    "; ".join(e.drawing_numbers) if e.drawing_numbers else "",
+                    r.match_type,
+                    r.matched_value,
+                    f"{r.score:.3f}",
+                    e.file_type.upper(),
+                    e.title or "",
+                    e.error or "",
+                    e.file_path,
+                    os.path.dirname(e.file_path),
+                ])
+
+    @staticmethod
+    def _write_index_csv(path: str, entries: list):
+        """インデックス全件を CSV に書き出す。"""
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "ファイル名",
+                "ファイル種別",
+                "図面番号",
+                "タイトル",
+                "抽出テキスト冒頭500字",
+                "エラー",
+                "ファイルパス",
+                "フォルダ",
+            ])
+            for e in entries:
+                writer.writerow([
+                    e.filename,
+                    e.file_type.upper(),
+                    "; ".join(e.drawing_numbers) if e.drawing_numbers else "",
+                    e.title or "",
+                    e.texts_blob[:500].replace("\n", " "),
+                    e.error or "",
+                    e.file_path,
+                    os.path.dirname(e.file_path),
+                ])
 
     # ------------------------------------------------------------------ #
     #  Utility actions                                                     #
